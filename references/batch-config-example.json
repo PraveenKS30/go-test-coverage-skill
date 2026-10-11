@@ -1,0 +1,39 @@
+{
+  "out_dir": "gocov-out",
+  "jobs": 2,
+  "budget": {
+    "max_usd_total": 20,
+    "max_usd_per_repo": 10,
+    "max_usd_per_item": 1.5,
+    "item_timeout_min": 15,
+    "time_limit_min": 0
+  },
+  "models": { "default": "sonnet", "escalate": "opus" },
+  "min_uncovered_stmts": 15,
+  "max_attempts": 2,
+  "goal_margin_pct": 3,
+  "est_usd_per_item": 0.6,
+  "est_min_per_item": 4,
+  "race": false,
+  "allow_deps": false,
+  "repos": [
+    {
+      "name": "service-a",
+      "path": "/abs/or/relative/path/to/service-a",
+      "goal": 80,
+      "goal_basis": "adjusted",
+      "paths": [],
+      "test_flags": [],
+      "exclude": [],
+      "branch": "coverage/auto"
+    },
+    {
+      "name": "service-b",
+      "path": "../service-b",
+      "goal": 60,
+      "paths": ["internal/billing", "pkg/util/strings.go"],
+      "test_flags": ["-tags=unit"],
+      "exclude": ["**/*_generated.go"]
+    }
+  ]
+}

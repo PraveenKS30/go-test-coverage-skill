@@ -1,0 +1,6 @@
+# built engine binaries
+scripts/bin/
+
+# run output
+gocov-out/
+*.out
