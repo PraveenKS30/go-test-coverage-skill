@@ -28,7 +28,7 @@ func cmdReport(ctx context.Context, o *opts) error {
 		if err != nil || len(mods) == 0 {
 			return fmt.Errorf("%s: no go.mod found under %s", rc.Name, rc.Path)
 		}
-		st := &RepoState{Name: rc.Name, Path: rc.Path, Goal: rc.Goal, GoalBasis: rc.GoalBasis, Scope: rc.Paths, Modules: mods}
+		st := &RepoState{Name: rc.Name, Path: rc.Path, Goal: rc.Goal, GoalBasis: rc.GoalBasis, Scope: rc.Paths, Modules: mods, UncovBlocks: map[string][]UBlock{}}
 		for _, m := range mods {
 			fmt.Printf("== %s: measuring module %s (go %s) - this can take a while\n", rc.Name, m.Dir, m.GoVersion)
 			meas, err := measure(ctx, rc.Path, m, "", rc.TestFlags, filepath.Join(repoDir(o, rc.Name), "logs", "baseline-"+slug(m.Dir)+".log"))
@@ -42,8 +42,9 @@ func cmdReport(ctx context.Context, o *opts) error {
 			if meas.Fallback {
 				st.Warnings = append(st.Warnings, fmt.Sprintf("module %q: -coverpkg=./... failed to build; fell back to per-package coverage. Untested packages are missing from the denominator, so SonarQube would read LOWER than this.", m.Dir))
 			}
-			st.Rows = append(st.Rows, meas.Rows...)
+			st.absorb(meas)
 		}
+		st.BaseFailing = st.Failing
 		applyExcludes(st, rc)
 		st.BuildTagTests = countBuildTagged(rc.Path)
 		if o.cfg.MaxComplexity > 0 {
@@ -114,7 +115,12 @@ func cmdPlan(o *opts) error {
 			return err
 		}
 		buildPlan(o, st)
+		// "planned" means nothing written yet (begin/run then require a clean
+		// tree); a re-plan after progress must not reset that.
 		st.Status = "planned"
+		if st.hasProgress() {
+			st.Status = "in-progress"
+		}
 		st.log("planned")
 		if err := saveState(o, st); err != nil {
 			return err
@@ -144,8 +150,19 @@ func estimate(o *opts, items int) estimateT {
 }
 
 // buildPlan ranks packages by value score and queues only as many as the goal
-// plausibly needs; the rest become "reserve" (visible, not executed).
+// plausibly needs; the rest become "reserve" (visible, not executed). Re-running
+// it (e.g. after a pilot) keeps done/blocked items as they are - their gain is
+// already in the coverage figures - and carries attempts and spend over to the
+// packages it re-ranks.
 func buildPlan(o *opts, st *RepoState) {
+	var settled []Item
+	prev := map[string]Item{}
+	for _, it := range st.Items {
+		if it.Status == "done" || it.Status == "blocked" {
+			settled = append(settled, it)
+		}
+		prev[it.ID] = it
+	}
 	type key struct{ mod, pkg string }
 	groups := map[key]*Item{}
 	hardStmts := map[key]int{}
@@ -154,6 +171,9 @@ func buildPlan(o *opts, st *RepoState) {
 			continue
 		}
 		k := key{r.Module, r.Pkg}
+		if p, ok := prev[slug(k.mod)+":"+k.pkg]; ok && (p.Status == "done" || p.Status == "blocked") {
+			continue
+		}
 		it := groups[k]
 		if it == nil {
 			it = &Item{Module: r.Module, Pkg: r.Pkg}
@@ -181,6 +201,9 @@ func buildPlan(o *opts, st *RepoState) {
 		sort.Strings(it.Files)
 		it.ID = slug(k.mod) + ":" + k.pkg
 		it.Status = "reserve"
+		if p, ok := prev[it.ID]; ok {
+			it.Attempts, it.CostUSD = p.Attempts, p.CostUSD
+		}
 		items = append(items, *it)
 	}
 	sort.Slice(items, func(i, j int) bool {
@@ -214,13 +237,27 @@ func buildPlan(o *opts, st *RepoState) {
 		}
 		st.ProjectedPct = g.Pct()
 	}
-	st.Items = items
+	st.Items = append(settled, items...)
+}
+
+// hasProgress reports whether any item has been worked to a final result.
+func (s *RepoState) hasProgress() bool {
+	for _, it := range s.Items {
+		if it.Status == "done" || it.Status == "blocked" {
+			return true
+		}
+	}
+	return false
 }
 
 func writePlan(o *opts, st *RepoState) error {
 	var sb strings.Builder
 	g := st.goalTotals()
-	fmt.Fprintf(&sb, "# Test plan - %s\n\nGenerated %s. **No tests have been written yet.**\n\n", st.Name, time.Now().Format("2006-01-02 15:04"))
+	written := "**No tests have been written yet.**"
+	if st.hasProgress() {
+		written = "Re-plan: done/blocked items are kept as they are and their gain is already in the current figure."
+	}
+	fmt.Fprintf(&sb, "# Test plan - %s\n\nGenerated %s. %s\n\n", st.Name, time.Now().Format("2006-01-02 15:04"), written)
 	fmt.Fprintf(&sb, "- Goal: **%.0f%%** (%s basis%s)\n- Current: **%.2f%%** (%d/%d statements)\n- Plan projects: **~%.1f%%** after queued items (estimate; verified by a fresh full run at the end)\n",
 		st.Goal, st.GoalBasis, scopeNote(st), g.Pct(), g.Covered, g.Stmts, st.ProjectedPct)
 	queued := 0
@@ -471,18 +508,18 @@ func cmdStatus(o *opts) error {
 
 // fullMeasure re-runs every module with the same flags as the baseline.
 func fullMeasure(ctx context.Context, o *opts, st *RepoState, rc RepoCfg, tag string) error {
-	var rows []FileCov
+	var meas []*Measurement
 	for _, m := range st.Modules {
-		meas, err := measure(ctx, rc.Path, m, "", rc.TestFlags, filepath.Join(repoDir(o, rc.Name), "logs", tag+"-"+slug(m.Dir)+".log"))
+		ms, err := measure(ctx, rc.Path, m, "", rc.TestFlags, filepath.Join(repoDir(o, rc.Name), "logs", tag+"-"+slug(m.Dir)+".log"))
 		if err != nil {
 			return err
 		}
-		if meas.TestExit != 0 {
-			st.Reason = fmt.Sprintf("module %q has failing tests at %s (exit %d); see %s", m.Dir, tag, meas.TestExit, meas.Log)
-		}
-		rows = append(rows, meas.Rows...)
+		meas = append(meas, ms)
 	}
-	st.Rows = rows
+	st.Rows, st.UncovBlocks, st.Failing = nil, nil, nil
+	for _, ms := range meas {
+		st.absorb(ms)
+	}
 	applyExcludes(st, rc)
 	st.Verified = true
 	return nil
@@ -515,12 +552,34 @@ func cmdVerify(ctx context.Context, o *opts) error {
 	return writeSummary(o)
 }
 
-// finalize sets the terminal status from a VERIFIED measurement.
+// newFailures returns packages failing in the latest full run that were not
+// already failing at baseline.
+func (s *RepoState) newFailures() []string {
+	base := map[string]bool{}
+	for _, p := range s.BaseFailing {
+		base[p] = true
+	}
+	var out []string
+	for _, p := range s.Failing {
+		if !base[p] {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// finalize sets the terminal status from a VERIFIED measurement. A repo is
+// achieved only if the goal is met AND no package fails that passed at baseline.
 func finalize(o *opts, st *RepoState) {
 	pct := st.goalTotals().Pct()
 	switch {
+	case len(st.newFailures()) > 0:
+		st.Status, st.Reason = "failing-tests", fmt.Sprintf("verified %.2f%% (goal %.0f%%) but tests now fail in %s, which passed at baseline - fix them before calling this done", pct, st.Goal, strings.Join(st.newFailures(), ", "))
 	case pct >= st.Goal:
 		st.Status, st.Reason = "achieved", fmt.Sprintf("verified %.2f%% >= goal %.0f%% by a fresh full run", pct, st.Goal)
+		if len(st.Failing) > 0 {
+			st.Reason += fmt.Sprintf("; still failing as at baseline (pre-existing, not caused by new tests): %s", strings.Join(st.Failing, ", "))
+		}
 	default:
 		reserve, blocked := 0, 0
 		for _, it := range st.Items {
@@ -557,6 +616,20 @@ func writeFinal(o *opts, st *RepoState) error {
 			extra += " " + strings.Join(it.TestFiles, ", ")
 		}
 		fmt.Fprintf(&sb, "| `%s` | %s | %.1f%% -> %.1f%% | %d | %d | $%.2f | %s |\n", itemName(it), it.Status, it.PkgBefore, it.PkgAfter, it.Gained, it.Attempts, it.CostUSD, strings.TrimSpace(extra))
+	}
+	if len(st.Failing) > 0 {
+		sb.WriteString("\n## Failing packages (latest full run)\n\n")
+		base := map[string]bool{}
+		for _, p := range st.BaseFailing {
+			base[p] = true
+		}
+		for _, p := range st.Failing {
+			origin := "NEW - passed at baseline"
+			if base[p] {
+				origin = "pre-existing - failing at baseline"
+			}
+			fmt.Fprintf(&sb, "- `%s` (%s)\n", p, origin)
+		}
 	}
 	if len(st.Warnings) > 0 {
 		sb.WriteString("\n## Pre-existing warnings\n\n")

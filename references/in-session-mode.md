@@ -4,7 +4,7 @@ The session you are already in is authenticated, so it writes the tests itself. 
 
 ## Loop for one package (take Item IDs from `PLAN.md`, top first)
 
-1. `gocov begin -config cfg.json -repo R -item ID` - checks out the work branch, measures the package, snapshots the tree, prints the focused prompt (package path, uncovered line ranges, rules, complexity limit).
+1. `gocov begin -config cfg.json -repo R -item ID` - checks out the work branch, measures the package, snapshots the tree, prints the focused prompt (package path, uncovered line ranges, rules, complexity limit). It refuses to start while a production file differs from HEAD - usually a mutation from the previous package that was not restored; `git checkout HEAD -- <file>` and retry.
 2. **Read first**: the source files named in the prompt, the package's existing `_test.go` (including build-tagged ones), and what the code depends on (services, stores, models) so assertions are real. Before the first test in a repo also read `junk-patterns.md`. Match the existing style: black-box (`package x_test`) vs white-box, existing helpers; testify only if already a dependency. If `go.mod` says go < 1.22, add `tc := tc` before `t.Parallel()` in table loops.
 3. **Write table-driven behavioral tests** for untested exported funcs and branchy unexported ones. Prefer driving real collaborators (router + real in-memory store, `httptest`) over mocks of types you own; small consumer-side fakes or wrappers for failure injection. Inject clocks; no sleeps, no network, `t.TempDir()`.
 4. **Keep functions under the complexity limit** - pattern in `complexity.md`.

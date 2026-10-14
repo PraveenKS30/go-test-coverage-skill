@@ -139,11 +139,13 @@ func runRepo(ctx context.Context, o *opts, rc RepoCfg, b *budget) error {
 			break
 		}
 		if o.dryRun {
-			meas, err := measureItem(ctx, o, rc, st, it, "dry")
-			if err != nil {
+			if err := ensureBlocks(ctx, o, st, rc); err != nil {
 				return err
 			}
-			say("---- DRY RUN (%s, item %s) ----\ncommand: %s\n\n%s", rc.Name, it.ID, claudeArgsString(o, modelFor(o, it, 1), left), buildPrompt(o, rc, st, it, meas, ""))
+			if _, err := measureItem(ctx, o, rc, st, it, "dry"); err != nil {
+				return err
+			}
+			say("---- DRY RUN (%s, item %s) ----\ncommand: %s\n\n%s", rc.Name, it.ID, claudeArgsString(o, modelFor(o, it, 1), left), buildPrompt(o, rc, st, it, ""))
 			return nil
 		}
 		st.Status = "in-progress"
@@ -263,16 +265,23 @@ func measureItem(ctx context.Context, o *opts, rc RepoCfg, st *RepoState, it *It
 }
 
 func runItem(ctx context.Context, o *opts, rc RepoCfg, st *RepoState, it *Item, b *budget, git bool) error {
+	if git {
+		if err := requireCleanProduction(o, rc); err != nil {
+			return &fatalErr{err.Error()}
+		}
+	}
+	if err := ensureBlocks(ctx, o, st, rc); err != nil {
+		return err
+	}
 	before, err := measureItem(ctx, o, rc, st, it, "pre")
 	if err != nil {
 		it.Status, it.Reason = "blocked", "package does not build/test at baseline: "+err.Error()
 		say("[%s] BLOCKED %s: %s", rc.Name, it.ID, it.Reason)
 		return nil
 	}
-	preCov := coverOf(before.Rows, it.Files)
-	it.PreCovered = preCov
+	it.PreCovered = coverOf(before.Rows, it.Files)
 	recordPreComplexity(o, rc, it)
-	it.PkgBefore = pctOf(before.Rows, it.Files)
+	it.PkgBefore = pctOf(st.Rows, it.Files)
 	snap := snapshot(rc.Path, o.cfg.OutDir)
 	failNote := ""
 
@@ -285,7 +294,7 @@ func runItem(ctx context.Context, o *opts, rc RepoCfg, st *RepoState, it *Item, 
 		it.Attempts = attempt
 		model := modelFor(o, it, attempt)
 		say("[%s] %s attempt %d/%d (model %s, cap $%.2f)", rc.Name, it.ID, attempt, o.cfg.MaxAttempts, model, left)
-		cost, cerr := callClaude(ctx, o, rc, st, it, before, model, left, failNote)
+		cost, cerr := callClaude(ctx, o, rc, st, it, model, left, failNote)
 		it.CostUSD += cost
 		st.SpendUSD += cost
 		b.add(cost)
@@ -298,7 +307,7 @@ func runItem(ctx context.Context, o *opts, rc RepoCfg, st *RepoState, it *Item, 
 			failNote = "the previous attempt failed to complete: " + cerr.Error()
 		}
 
-		if ok, fn := verifyItem(ctx, o, rc, st, it, preCov, snap, git); ok {
+		if ok, fn := verifyItem(ctx, o, rc, st, it, snap, git); ok {
 			say("[%s]   item $%.2f, repo $%.2f/%.0f, run $%.2f/%.0f", rc.Name, it.CostUSD, st.SpendUSD, o.cfg.Budget.MaxUSDPerRepo, b.spent, o.cfg.Budget.MaxUSDTotal)
 			return nil
 		} else {
@@ -322,9 +331,9 @@ func runItem(ctx context.Context, o *opts, rc RepoCfg, st *RepoState, it *Item, 
 // author (headless claude, or the in-session agent) left in the tree. On
 // success it records the item as done. On failure it returns feedback for the
 // next attempt and leaves the tree as is (the caller decides to retry/revert).
-func verifyItem(ctx context.Context, o *opts, rc RepoCfg, st *RepoState, it *Item, preCov int, snap map[string]string, git bool) (bool, string) {
+func verifyItem(ctx context.Context, o *opts, rc RepoCfg, st *RepoState, it *Item, snap map[string]string, git bool) (bool, string) {
 	if git {
-		if bad := revertForbidden(rc.Path, snap, o.cfg.OutDir, o.cfg.AllowDeps); len(bad) > 0 {
+		if bad := revertForbidden(rc.Path, o.cfg.OutDir, o.cfg.AllowDeps); len(bad) > 0 {
 			say("[%s]   reverted forbidden edits: %s", rc.Name, strings.Join(bad, ", "))
 			st.Warnings = append(st.Warnings, fmt.Sprintf("%s: non-test files were edited %v; reverted by gocov", it.ID, bad))
 		}
@@ -356,15 +365,21 @@ func verifyItem(ctx context.Context, o *opts, rc RepoCfg, st *RepoState, it *Ite
 			return false, testComplexityFeedback(over, lim, o.cfg.ComplexityMetric)
 		}
 	}
-	gain := coverOf(after.Rows, it.Files) - preCov
+	newly := newlyCovered(st, it.Files, after)
+	gain := 0
+	for _, bs := range newly {
+		for _, b := range bs {
+			gain += b.Stmts
+		}
+	}
 	if gain < 1 {
-		return false, fmt.Sprintf("tests pass but covered 0 new statements in %v. Target the uncovered ranges listed.", it.Files)
+		return false, fmt.Sprintf("tests pass but covered 0 new statements in %v. Statements other packages' tests already cover do not count; target the uncovered ranges listed.", it.Files)
 	}
 	it.Gained = gain
-	it.PkgAfter = pctOf(after.Rows, it.Files)
 	it.Status, it.Reason = "done", ""
 	it.TestFiles = changedTestFiles(rc.Path, snap, o.cfg.OutDir)
-	applyGain(st, it.Files, gain, after.Rows)
+	applyGain(st, newly)
+	it.PkgAfter = pctOf(st.Rows, it.Files)
 	if o.commit && git {
 		gitCommit(rc.Path, it)
 	}
@@ -418,38 +433,72 @@ func pctOf(rows []FileCov, files []string) float64 {
 	return t.Pct()
 }
 
-// applyGain updates the live row estimates; a fresh full run replaces them.
-func applyGain(st *RepoState, files []string, gain int, after []FileCov) {
-	post := map[string]FileCov{}
-	for _, r := range after {
-		post[r.File] = r
-	}
-	left := gain
-	for i := range st.Rows {
-		p, ok := post[st.Rows[i].File]
-		if !ok || left <= 0 {
-			continue
-		}
-		inItem := false
-		for _, f := range files {
-			if f == st.Rows[i].File {
-				inItem = true
+// newlyCovered returns, per item file, the blocks still uncovered in the goal
+// metric that `after` hit. The item run only sees the package's own tests, but
+// the goal metric is a -coverpkg run where other packages' tests count too;
+// matching blocks (not counts) keeps statements those tests already cover from
+// being credited a second time.
+func newlyCovered(st *RepoState, files []string, after *Measurement) map[string][]UBlock {
+	out := map[string][]UBlock{}
+	for _, f := range files {
+		for _, b := range st.UncovBlocks[f] {
+			if after.Hit[f+":"+b.Span] {
+				out[f] = append(out[f], b)
 			}
 		}
-		if !inItem {
-			continue
-		}
-		room := st.Rows[i].Stmts - st.Rows[i].Covered
-		add := p.Covered
-		if add > room {
-			add = room
-		}
-		if add > left {
-			add = left
-		}
-		st.Rows[i].Covered += add
-		left -= add
 	}
+	return out
+}
+
+// applyGain moves newly covered blocks into the live row figures; a fresh full
+// run replaces them. The estimate can only be low (a new test may also cover
+// other packages), never high.
+func applyGain(st *RepoState, newly map[string][]UBlock) {
+	for f, hit := range newly {
+		done := map[string]bool{}
+		n := 0
+		for _, b := range hit {
+			done[b.Span] = true
+			n += b.Stmts
+		}
+		var left []UBlock
+		for _, b := range st.UncovBlocks[f] {
+			if !done[b.Span] {
+				left = append(left, b)
+			}
+		}
+		st.UncovBlocks[f] = left
+		for i := range st.Rows {
+			if st.Rows[i].File == f {
+				st.Rows[i].Covered += n
+			}
+		}
+	}
+}
+
+// uncovRanges lists, per file, the line ranges still uncovered in the goal metric.
+func uncovRanges(st *RepoState, files []string) map[string][]Range {
+	out := map[string][]Range{}
+	for _, f := range files {
+		var rs []Range
+		for _, b := range st.UncovBlocks[f] {
+			rs = append(rs, spanLines(b.Span))
+		}
+		if len(rs) > 0 {
+			out[f] = mergeRanges(rs)
+		}
+	}
+	return out
+}
+
+// ensureBlocks migrates state written before v2.5, which has no block-level
+// data: one fresh full run gives the exact uncovered blocks to credit against.
+func ensureBlocks(ctx context.Context, o *opts, st *RepoState, rc RepoCfg) error {
+	if st.UncovBlocks != nil {
+		return nil
+	}
+	say("[%s] state has no block-level coverage (written before v2.5) - one fresh full run to add it", rc.Name)
+	return fullMeasureQuiet(ctx, o, st, rc)
 }
 
 // ------------------------------------------------------------- claude -p ----
@@ -490,12 +539,12 @@ type claudeResult struct {
 	NumTurns       int     `json:"num_turns"`
 }
 
-func callClaude(ctx context.Context, o *opts, rc RepoCfg, st *RepoState, it *Item, before *Measurement, model string, usd float64, failNote string) (float64, error) {
+func callClaude(ctx context.Context, o *opts, rc RepoCfg, st *RepoState, it *Item, model string, usd float64, failNote string) (float64, error) {
 	cctx, cancel := context.WithTimeout(ctx, time.Duration(o.cfg.Budget.ItemTimeoutMin)*time.Minute)
 	defer cancel()
 	cmd := exec.CommandContext(cctx, "claude", claudeArgs(o, model, usd)...)
 	cmd.Dir = filepath.Join(rc.Path, filepath.FromSlash(it.Module))
-	cmd.Stdin = strings.NewReader(buildPrompt(o, rc, st, it, before, failNote))
+	cmd.Stdin = strings.NewReader(buildPrompt(o, rc, st, it, failNote))
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
 	err := cmd.Run()
@@ -527,7 +576,7 @@ const rules = `RULES (non-negotiable):
 - MUTATION CHECK for each new test function that guards branching logic: temporarily break the branch it protects, run the test and confirm it FAILS, then restore the original code EXACTLY and confirm it passes. Leave no mutation behind.
 - Run the package tests until green. Keep the final message under 8 lines: files written, behaviors covered, anything skipped and why.`
 
-func buildPrompt(o *opts, rc RepoCfg, st *RepoState, it *Item, before *Measurement, failNote string) string {
+func buildPrompt(o *opts, rc RepoCfg, st *RepoState, it *Item, failNote string) string {
 	var sb strings.Builder
 	mod := findModule(st, it.Module)
 	fmt.Fprintf(&sb, "Raise the unit-test coverage of ONE Go package with real, behavior-verifying tests.\n\n")
@@ -539,16 +588,22 @@ func buildPrompt(o *opts, rc RepoCfg, st *RepoState, it *Item, before *Measureme
 	if mod.GoVersion != "" && !goAtLeast122(mod.GoVersion) {
 		sb.WriteString("go.mod is below 1.22: if you use t.Parallel in table loops, copy the loop variable (tc := tc).\n")
 	}
-	sb.WriteString("\nUNCOVERED line ranges per file (prioritize largest, most logic-heavy first; skip trivial ones):\n")
-	files := append([]string(nil), it.Files...)
-	sort.Slice(files, func(i, j int) bool { return len(before.Uncov[files[i]]) > len(before.Uncov[files[j]]) })
+	sb.WriteString("\nUNCOVERED line ranges per file (prioritize largest, most logic-heavy first; skip trivial ones). Lines not listed are already covered, possibly by other packages' tests, and earn nothing:\n")
+	uncov := uncovRanges(st, it.Files)
+	var files []string
+	for _, f := range it.Files {
+		if len(uncov[f]) > 0 {
+			files = append(files, f)
+		}
+	}
+	sort.SliceStable(files, func(i, j int) bool { return len(uncov[files[i]]) > len(uncov[files[j]]) })
 	for i, f := range files {
 		if i >= 8 {
 			fmt.Fprintf(&sb, "- ... %d more files in the package\n", len(files)-i)
 			break
 		}
 		var rs []string
-		for j, r := range before.Uncov[f] {
+		for j, r := range uncov[f] {
 			if j >= 40 {
 				rs = append(rs, "...")
 				break
@@ -723,24 +778,46 @@ func isAllowedPath(p string, allowDeps bool) bool {
 	return false
 }
 
+// restore puts p back to HEAD (not the index, so a staged edit cannot
+// survive), or deletes it if HEAD does not have it.
 func restore(root, p string) {
-	if _, err := git(root, "ls-files", "--error-unmatch", "--", p); err == nil {
-		_, _ = git(root, "checkout", "--", p)
+	if _, err := git(root, "cat-file", "-e", "HEAD:"+p); err == nil {
+		_, _ = git(root, "checkout", "HEAD", "--", p)
 		return
 	}
+	_, _ = git(root, "rm", "--cached", "-q", "--ignore-unmatch", "--", p)
 	_ = os.Remove(filepath.Join(root, filepath.FromSlash(p)))
 }
 
-func revertForbidden(root string, snap map[string]string, outDir string, allowDeps bool) []string {
-	var bad []string
-	for _, p := range delta(root, outDir, snap) {
-		if _, existed := snap[p]; existed {
-			continue
-		}
+// dirtyProduction lists changed files an author may not touch (anything but
+// *_test.go, testdata/ and, with allowDeps, go.mod/go.sum).
+func dirtyProduction(root, outDir string, allowDeps bool) []string {
+	var out []string
+	for _, p := range dirtyFiles(root, outDir) {
 		if !isAllowedPath(p, allowDeps) {
-			restore(root, p)
-			bad = append(bad, p)
+			out = append(out, p)
 		}
+	}
+	return out
+}
+
+// requireCleanProduction refuses to start an item while production files
+// differ from HEAD: they could not be told apart from the author's edits, and
+// a leftover mutation would be tested against instead of the real code.
+func requireCleanProduction(o *opts, rc RepoCfg) error {
+	if dirty := dirtyProduction(rc.Path, o.cfg.OutDir, o.cfg.AllowDeps); len(dirty) > 0 {
+		return fmt.Errorf("non-test files differ from HEAD (e.g. %s - a mutation-check edit that was not restored?); restore them with `git checkout HEAD -- <file>` or commit them, then retry", dirty[0])
+	}
+	return nil
+}
+
+// revertForbidden restores every non-test file that differs from HEAD. Items
+// only start with production clean (requireCleanProduction), so each one was
+// changed during this item - including a mutation the author did not undo.
+func revertForbidden(root, outDir string, allowDeps bool) []string {
+	bad := dirtyProduction(root, outDir, allowDeps)
+	for _, p := range bad {
+		restore(root, p)
 	}
 	return bad
 }
@@ -826,15 +903,23 @@ func cmdBegin(ctx context.Context, o *opts, id string) error {
 	if err != nil {
 		return err
 	}
-	if st.Status == "planned" && isGit(rc.Path) {
-		if dirty := dirtyFiles(rc.Path, o.cfg.OutDir); len(dirty) > 0 {
-			return fmt.Errorf("working tree has uncommitted changes (e.g. %s); commit or stash first", dirty[0])
-		}
-		if rc.Branch != "" {
-			if err := gitCheckoutBranch(rc.Path, rc.Branch); err != nil {
-				return err
+	if isGit(rc.Path) {
+		if st.Status == "planned" {
+			if dirty := dirtyFiles(rc.Path, o.cfg.OutDir); len(dirty) > 0 {
+				return fmt.Errorf("working tree has uncommitted changes (e.g. %s); commit or stash first", dirty[0])
+			}
+			if rc.Branch != "" {
+				if err := gitCheckoutBranch(rc.Path, rc.Branch); err != nil {
+					return err
+				}
 			}
 		}
+		if err := requireCleanProduction(o, rc); err != nil {
+			return err
+		}
+	}
+	if err := ensureBlocks(ctx, o, st, rc); err != nil {
+		return err
 	}
 	before, err := measureItem(ctx, o, rc, st, it, "pre")
 	if err != nil {
@@ -842,14 +927,14 @@ func cmdBegin(ctx context.Context, o *opts, id string) error {
 	}
 	it.PreCovered = coverOf(before.Rows, it.Files)
 	recordPreComplexity(o, rc, it)
-	it.PkgBefore = pctOf(before.Rows, it.Files)
+	it.PkgBefore = pctOf(st.Rows, it.Files)
 	snap := snapshot(rc.Path, o.cfg.OutDir)
 	_ = os.MkdirAll(filepath.Dir(snapPath(o, rc, it)), 0o755)
 	data, _ := json.Marshal(snap)
 	if err := os.WriteFile(snapPath(o, rc, it), data, 0o644); err != nil {
 		return err
 	}
-	prompt := buildPrompt(o, rc, st, it, before, "")
+	prompt := buildPrompt(o, rc, st, it, "")
 	pp := filepath.Join(repoDir(o, rc.Name), "work", slug(it.ID)+".prompt.md")
 	if err := os.WriteFile(pp, []byte(prompt), 0o644); err != nil {
 		return err
@@ -898,7 +983,7 @@ func cmdFinish(ctx context.Context, o *opts, id string, abandon bool, cost float
 		fmt.Println("BLOCKED", it.ID, "- attempt reverted")
 		return saveState(o, st)
 	}
-	ok, fb := verifyItem(ctx, o, rc, st, it, it.PreCovered, snap, g)
+	ok, fb := verifyItem(ctx, o, rc, st, it, snap, g)
 	st.Verified = false
 	if err := saveState(o, st); err != nil {
 		return err

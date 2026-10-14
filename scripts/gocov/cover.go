@@ -35,12 +35,23 @@ func (f FileCov) Uncovered() int { return f.Stmts - f.Covered }
 // Range is an uncovered line range [Start, End].
 type Range struct{ Start, End int }
 
+// UBlock is one uncovered coverage block. Span is the profile's
+// "startLine.col,endLine.col", which is the same for a file whichever test
+// binary reported it, so blocks from different runs can be matched exactly.
+type UBlock struct {
+	Span  string `json:"span"`
+	Stmts int    `json:"stmts"`
+}
+
 // Measurement is the outcome of one `go test` coverage run.
 type Measurement struct {
 	Rows     []FileCov
-	Uncov    map[string][]Range // rel file -> uncovered ranges
-	TestExit int                // non-zero => at least one failing test (profile still usable)
-	Fallback bool               // -coverpkg had to be dropped
+	Uncov    map[string][]Range  // rel file -> uncovered ranges
+	UncovB   map[string][]UBlock // rel file -> uncovered blocks
+	Hit      map[string]bool     // "rel file:span" -> hit by this run
+	TestExit int                 // non-zero => at least one failing test (profile still usable)
+	Fallback bool                // -coverpkg had to be dropped
+	Failing  []string            // packages go test reported as FAIL
 	Log      string
 }
 
@@ -106,6 +117,7 @@ func discoverModules(root string) ([]Module, error) {
 
 type block struct {
 	file       string
+	span       string // "startLine.col,endLine.col"
 	start, end int
 	stmts      int
 	hit        bool
@@ -143,7 +155,7 @@ func parseProfile(p string) (map[string]*block, error) {
 			if m == nil {
 				continue
 			}
-			b = &block{file: m[1], stmts: stmts}
+			b = &block{file: m[1], span: parts[0][len(m[1])+1:], stmts: stmts}
 			fmt.Sscanf(m[2], "%d", &b.start)
 			fmt.Sscanf(m[3], "%d", &b.end)
 			blocks[parts[0]] = b
@@ -213,11 +225,73 @@ func measure(ctx context.Context, root string, mod Module, pkgRel string, flags 
 		m.Fallback = true
 		blocks, _ = parseProfile(tmp.Name())
 	}
+	if m.TestExit != 0 {
+		m.Failing = failingPkgs(logPath)
+		if len(m.Failing) == 0 {
+			// non-zero exit without a FAIL line (vet, go command error): still a failure
+			m.Failing = []string{fmt.Sprintf("module %s (go test exit %d)", mod.Dir, m.TestExit)}
+		}
+	}
 	if len(blocks) == 0 {
 		return m, fmt.Errorf("no coverage profile produced for module %q (exit %d) - likely a BUILD failure, see %s", mod.Dir, m.TestExit, logPath)
 	}
 	m.Rows, m.Uncov = rowsFromBlocks(root, mod, blocks)
+	m.UncovB, m.Hit = map[string][]UBlock{}, map[string]bool{}
+	for _, b := range blocks {
+		rel := relFile(mod, b.file)
+		if b.hit {
+			m.Hit[rel+":"+b.span] = true
+		} else {
+			m.UncovB[rel] = append(m.UncovB[rel], UBlock{Span: b.span, Stmts: b.stmts})
+		}
+	}
+	for f := range m.UncovB {
+		sort.Slice(m.UncovB[f], func(i, j int) bool { return m.UncovB[f][i].Span < m.UncovB[f][j].Span })
+	}
 	return m, nil
+}
+
+// "FAIL\t<pkg>\t0.1s" / "FAIL\t<pkg> [build failed]"; [ \t] so a bare "FAIL"
+// line does not swallow the next line ("coverage: ...").
+var failRe = regexp.MustCompile(`(?m)^FAIL[ \t]+(\S+)`)
+
+// failingPkgs reads a `go test` log and returns the packages reported as FAIL
+// (failing tests, build or setup failures), sorted and de-duplicated.
+func failingPkgs(logPath string) []string {
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		return nil
+	}
+	set := map[string]bool{}
+	for _, m := range failRe.FindAllStringSubmatch(string(data), -1) {
+		set[m[1]] = true
+	}
+	var out []string
+	for p := range set {
+		out = append(out, p)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// relFile converts a profile file (import path + name) to repo-relative.
+func relFile(mod Module, file string) string {
+	rel := file
+	if mod.Path != "" && strings.HasPrefix(rel, mod.Path+"/") {
+		rel = strings.TrimPrefix(rel, mod.Path+"/")
+	}
+	if mod.Dir != "." {
+		rel = path.Join(mod.Dir, rel)
+	}
+	return rel
+}
+
+// spanLines turns a block span "12.5,14.2" into its line range.
+func spanLines(span string) Range {
+	var r Range
+	var c1, c2 int
+	fmt.Sscanf(span, "%d.%d,%d.%d", &r.Start, &c1, &r.End, &c2)
+	return r
 }
 
 func rowsFromBlocks(root string, mod Module, blocks map[string]*block) ([]FileCov, map[string][]Range) {
@@ -225,13 +299,7 @@ func rowsFromBlocks(root string, mod Module, blocks map[string]*block) ([]FileCo
 	files := map[string]*acc{}
 	uncov := map[string][]Range{}
 	for _, b := range blocks {
-		rel := b.file
-		if mod.Path != "" && strings.HasPrefix(rel, mod.Path+"/") {
-			rel = strings.TrimPrefix(rel, mod.Path+"/")
-		}
-		if mod.Dir != "." {
-			rel = path.Join(mod.Dir, rel)
-		}
+		rel := relFile(mod, b.file)
 		a := files[rel]
 		if a == nil {
 			a = &acc{}

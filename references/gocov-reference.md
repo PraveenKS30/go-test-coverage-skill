@@ -9,8 +9,8 @@ Build once: `cd <skill-dir>/scripts/gocov && go build -o ../bin/gocov .` (add `.
 | Command | What it does | Writes tests? |
 |---|---|---|
 | `gocov report` | Finds every `go.mod`, runs a full `-coverpkg=./...` baseline per repo, writes `COVERAGE_REPORT.md`, `state.json`, `SUMMARY.md`. Refuses to overwrite a repo that already has progress unless `-force`. | no |
-| `gocov plan` | Groups uncovered code by package, ranks by value score, queues only what the goal needs, writes `PLAN.md` (cost/time estimate, "goal likely unreachable" warning). | no |
-| `gocov begin -repo R -item ID [-q]` | Checks out the work branch, measures the package, snapshots the tree, writes and prints the task prompt (`-q`: print only the prompt file path). | no |
+| `gocov plan` | Groups uncovered code by package, ranks by value score, queues only what the goal needs, writes `PLAN.md` (cost/time estimate, "goal likely unreachable" warning). Safe to re-run after progress (e.g. after a pilot): `done`/`blocked` items are kept, only the rest is re-ranked. | no |
+| `gocov begin -repo R -item ID [-q]` | Checks out the work branch, measures the package, snapshots the tree, writes and prints the task prompt (`-q`: print only the prompt file path). Refuses while any non-test file differs from HEAD (e.g. an unrestored mutation). | no |
 | `gocov finish -repo R -item ID [-abandon] [-cost USD]` | Verifies what was written; accepts, returns feedback, or with `-abandon` reverts and blocks the item. **Exit code 0 = accepted, 3 = not accepted** (feedback printed and saved to `work/<id>.feedback.md`). | no |
 | `gocov queue -repo R` | Prints queued item IDs, one per line - for shell loops. | no |
 | `gocov goal -repo R` | Prints the running estimate; exit 0 if it has reached the goal, 10 if not. | no |
@@ -31,7 +31,8 @@ Common flags: `-config FILE` (multi-repo) or `-path DIR [-goal N] [-scope a,b]` 
 ## Item statuses
 
 `queued` (will run) - `reserve` (ranked, not needed for the goal) - `done` - `blocked(reason)`.
-Repo statuses: `baselined` - `planned` - `in-progress` - `achieved` | `needs-replan` | `not-achieved` | `paused-budget` | `paused-error`.
+Repo statuses: `baselined` - `planned` - `in-progress` - `achieved` | `needs-replan` | `not-achieved` | `failing-tests` | `paused-budget` | `paused-error`.
+`achieved` needs the goal met **and** no package failing that passed at baseline; packages already failing at baseline are named as pre-existing. `failing-tests` = goal may be met, but a package that was green at baseline now fails (listed in `FINAL_REPORT.md`).
 
 ## Config keys
 
@@ -46,4 +47,4 @@ Working example: `batch-config-example.json`.
 - Always `-coverpkg=./...` for the baseline and the final verify; if it will not build (cgo, tags) gocov falls back and says so in the report.
 - Profile blocks are de-duplicated and OR-ed across test binaries; totals are statement-weighted, never an average of percentages.
 - `adjusted` removes generated and vendor code from the goal metric. `main` composition roots stay in it.
-- Per-package numbers during a run come from that package's own tests; the final verify counts cross-package coverage too, so it can be higher.
+- An item's gain is counted per coverage block: only blocks still uncovered in the goal metric that the package's tests now hit. Statements other packages' tests already cover (visible through `-coverpkg`) earn nothing, and the task prompt lists only the lines still uncovered. The running estimate can therefore only be low, never high - the final verify also credits cross-package coverage by the new tests.
