@@ -12,6 +12,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
 	"path"
@@ -37,10 +38,10 @@ type budget struct {
 	cfg      *Config
 }
 
-func (b *budget) totalLeft() float64 {
+func (b *budget) runSpent() float64 {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return b.cfg.Budget.MaxUSDTotal - b.spent
+	return b.spent
 }
 func (b *budget) add(u float64) { b.mu.Lock(); b.spent += u; b.mu.Unlock() }
 func (b *budget) timeUp() bool {
@@ -133,19 +134,17 @@ func runRepo(ctx context.Context, o *opts, rc RepoCfg, b *budget) error {
 			st.Status, st.Reason = "paused-budget", "time limit reached; re-run to resume"
 			break
 		}
-		left := min3(o.cfg.Budget.MaxUSDPerRepo-st.SpendUSD, b.totalLeft(), o.cfg.Budget.MaxUSDPerItem)
-		if left < 0.05 {
-			st.Status, st.Reason = "paused-budget", fmt.Sprintf("budget cap reached (next call allowed $%.2f; per-item cap $%.2f, repo spend $%.2f/$%.2f, run spend $%.2f/$%.2f); raise the cap in the config and re-run to resume", left, o.cfg.Budget.MaxUSDPerItem, st.SpendUSD, o.cfg.Budget.MaxUSDPerRepo, b.spent, o.cfg.Budget.MaxUSDTotal)
+		left := callCap(o.cfg, st.SpendUSD, b.runSpent())
+		if left < minCallUSD {
+			st.Status, st.Reason = "paused-budget", budgetReason(o.cfg, left, st.SpendUSD, b.runSpent())
 			break
 		}
 		if o.dryRun {
-			if err := ensureBlocks(ctx, o, st, rc); err != nil {
+			prompt, err := dryRunPrompt(ctx, o, rc, st, it)
+			if err != nil {
 				return err
 			}
-			if _, err := measureItem(ctx, o, rc, st, it, "dry"); err != nil {
-				return err
-			}
-			say("---- DRY RUN (%s, item %s) ----\ncommand: %s\n\n%s", rc.Name, it.ID, claudeArgsString(o, modelFor(o, it, 1), left), buildPrompt(o, rc, st, it, ""))
+			say("---- DRY RUN (%s, item %s) ----\ncommand: %s\n\n%s", rc.Name, it.ID, claudeArgsString(o, modelFor(o, it, 1), left), prompt)
 			return nil
 		}
 		st.Status = "in-progress"
@@ -227,6 +226,20 @@ func min3(a, b, c float64) float64 {
 	return m
 }
 
+// minCallUSD is the smallest per-call cap worth starting a claude call with.
+const minCallUSD = 0.05
+
+// callCap is the --max-budget-usd for the next claude call: the smallest of
+// the per-item cap and what is left of the repo and run budgets, rounded down
+// to whole cents (so $0.25 - $0.20 is $0.05, not 0.0499...).
+func callCap(cfg *Config, repoSpent, runSpent float64) float64 {
+	return math.Floor(min3(cfg.Budget.MaxUSDPerRepo-repoSpent, cfg.Budget.MaxUSDTotal-runSpent, cfg.Budget.MaxUSDPerItem)*100+1e-6) / 100
+}
+
+func budgetReason(cfg *Config, left, repoSpent, runSpent float64) string {
+	return fmt.Sprintf("budget cap reached (next call allowed $%.2f; per-item cap $%.2f, repo spend $%.2f/$%.2f, run spend $%.2f/$%.2f); raise the cap in the config and re-run to resume", left, cfg.Budget.MaxUSDPerItem, repoSpent, cfg.Budget.MaxUSDPerRepo, runSpent, cfg.Budget.MaxUSDTotal)
+}
+
 func modelFor(o *opts, it *Item, attempt int) string {
 	if attempt > 1 || it.Hard || it.Uncovered > 300 {
 		return o.cfg.Models.Escalate
@@ -273,21 +286,16 @@ func runItem(ctx context.Context, o *opts, rc RepoCfg, st *RepoState, it *Item, 
 	if err := ensureBlocks(ctx, o, st, rc); err != nil {
 		return err
 	}
-	before, err := measureItem(ctx, o, rc, st, it, "pre")
-	if err != nil {
-		it.Status, it.Reason = "blocked", "package does not build/test at baseline: "+err.Error()
+	if err := preMeasure(ctx, o, rc, st, it); err != nil {
 		say("[%s] BLOCKED %s: %s", rc.Name, it.ID, it.Reason)
 		return nil
 	}
-	it.PreCovered = coverOf(before.Rows, it.Files)
-	recordPreComplexity(o, rc, it)
-	it.PkgBefore = pctOf(st.Rows, it.Files)
 	snap := snapshot(rc.Path, o.cfg.OutDir)
 	failNote := ""
 
 	for attempt := 1; attempt <= o.cfg.MaxAttempts; attempt++ {
-		left := min3(o.cfg.Budget.MaxUSDPerRepo-st.SpendUSD, b.totalLeft(), o.cfg.Budget.MaxUSDPerItem)
-		if left < 0.05 {
+		left := callCap(o.cfg, st.SpendUSD, b.runSpent())
+		if left < minCallUSD {
 			it.Reason = "stopped: budget exhausted mid-item"
 			break
 		}
@@ -324,6 +332,36 @@ func runItem(ctx context.Context, o *opts, rc RepoCfg, st *RepoState, it *Item, 
 	}
 	say("[%s] BLOCKED %s: %s", rc.Name, it.ID, it.Reason)
 	st.log("blocked:" + it.ID)
+	return nil
+}
+
+// dryRunPrompt checks that the item's package builds and returns the task
+// prompt a real run would send. It changes nothing on disk except the log, and
+// st only in memory (callers do not save it).
+func dryRunPrompt(ctx context.Context, o *opts, rc RepoCfg, st *RepoState, it *Item) (string, error) {
+	if err := ensureBlocks(ctx, o, st, rc); err != nil {
+		return "", err
+	}
+	if _, err := measureItem(ctx, o, rc, st, it, "dry"); err != nil {
+		return "", err
+	}
+	it.PkgBefore = pctOf(st.Rows, it.Files)
+	return buildPrompt(o, rc, st, it, ""), nil
+}
+
+// preMeasure measures the item's package before anything is written. A
+// package that does not build or test at baseline cannot be worked on: it is
+// marked blocked so no driver retries it forever.
+func preMeasure(ctx context.Context, o *opts, rc RepoCfg, st *RepoState, it *Item) error {
+	before, err := measureItem(ctx, o, rc, st, it, "pre")
+	if err != nil {
+		it.Status, it.Reason = "blocked", "package does not build/test at baseline: "+err.Error()
+		st.log("blocked:" + it.ID)
+		return err
+	}
+	it.PreCovered = coverOf(before.Rows, it.Files)
+	recordPreComplexity(o, rc, it)
+	it.PkgBefore = pctOf(st.Rows, it.Files)
 	return nil
 }
 
@@ -903,6 +941,9 @@ func cmdBegin(ctx context.Context, o *opts, id string) error {
 	if err != nil {
 		return err
 	}
+	if o.dryRun {
+		return beginDryRun(ctx, o, rc, st, it)
+	}
 	if isGit(rc.Path) {
 		if st.Status == "planned" {
 			if dirty := dirtyFiles(rc.Path, o.cfg.OutDir); len(dirty) > 0 {
@@ -921,13 +962,14 @@ func cmdBegin(ctx context.Context, o *opts, id string) error {
 	if err := ensureBlocks(ctx, o, st, rc); err != nil {
 		return err
 	}
-	before, err := measureItem(ctx, o, rc, st, it, "pre")
-	if err != nil {
-		return err
+	if err := preMeasure(ctx, o, rc, st, it); err != nil {
+		if serr := saveState(o, st); serr != nil {
+			return serr
+		}
+		fmt.Printf("BLOCKED %s: %s\n", it.ID, it.Reason)
+		exitCode = 3
+		return nil
 	}
-	it.PreCovered = coverOf(before.Rows, it.Files)
-	recordPreComplexity(o, rc, it)
-	it.PkgBefore = pctOf(st.Rows, it.Files)
 	snap := snapshot(rc.Path, o.cfg.OutDir)
 	_ = os.MkdirAll(filepath.Dir(snapPath(o, rc, it)), 0o755)
 	data, _ := json.Marshal(snap)
@@ -949,6 +991,27 @@ func cmdBegin(ctx context.Context, o *opts, id string) error {
 		return nil
 	}
 	fmt.Printf("Task prompt for %s written to %s\nWrite the *_test.go files, then run: gocov finish -repo %s -item %s\n\n%s\n", it.ID, pp, rc.Name, it.ID, prompt)
+	return nil
+}
+
+// beginDryRun writes the prompt begin would write and nothing else: no branch
+// checkout, no snapshot, no state save. A "planned" repo must stay planned, or
+// the real begin would skip the clean-tree check and the branch checkout.
+func beginDryRun(ctx context.Context, o *opts, rc RepoCfg, st *RepoState, it *Item) error {
+	prompt, err := dryRunPrompt(ctx, o, rc, st, it)
+	if err != nil {
+		return err
+	}
+	pp := filepath.Join(repoDir(o, rc.Name), "work", slug(it.ID)+".dry-run.prompt.md")
+	_ = os.MkdirAll(filepath.Dir(pp), 0o755)
+	if err := os.WriteFile(pp, []byte(prompt), 0o644); err != nil {
+		return err
+	}
+	if o.quiet {
+		fmt.Println(pp)
+		return nil
+	}
+	fmt.Printf("DRY RUN - nothing saved, tree and branch untouched. Task prompt for %s written to %s\n\n%s\n", it.ID, pp, prompt)
 	return nil
 }
 
@@ -1023,6 +1086,50 @@ func recordPreComplexity(o *opts, rc RepoCfg, it *Item) {
 
 func feedbackPath(o *opts, rc RepoCfg, it *Item) string {
 	return filepath.Join(repoDir(o, rc.Name), "work", slug(it.ID)+".feedback.md")
+}
+
+// cmdNextCall tells a fan-out script how to make the next claude call for an
+// item, by the same rules `gocov run` uses. It prints
+// "MODEL CAP_USD TIMEOUT_SEC WORKDIR" (WORKDIR last: it may contain spaces)
+// and exits 0, or prints why not and exits 4 (budget or time limit reached:
+// stop the run; the repo is marked paused-budget) or 5 (max_attempts used:
+// abandon the item). With -dry-run nothing is saved. runSpent and elapsed are the script's own run totals,
+// the counterparts of gocov run's run budget and time limit.
+func cmdNextCall(o *opts, id string, attempt int, runSpent float64, elapsed int) error {
+	rc, st, err := oneRepo(o)
+	if err != nil {
+		return err
+	}
+	it, err := itemByID(st, id)
+	if err != nil {
+		return err
+	}
+	if attempt < 1 {
+		return fmt.Errorf("usage: gocov next-call -repo R -item ID -attempt K [-spent USD] [-elapsed SEC]")
+	}
+	if attempt > o.cfg.MaxAttempts {
+		fmt.Printf("%s: all %d attempt(s) used (max_attempts)\n", it.ID, o.cfg.MaxAttempts)
+		exitCode = 5
+		return nil
+	}
+	pause := ""
+	// like gocov run, the time limit is checked before an item, not between attempts
+	if lim := o.cfg.Budget.TimeLimitMin; lim > 0 && attempt == 1 && elapsed >= lim*60 {
+		pause = "time limit reached; re-run to resume"
+	} else if left := callCap(o.cfg, st.SpendUSD, runSpent); left < minCallUSD {
+		pause = budgetReason(o.cfg, left, st.SpendUSD, runSpent)
+	} else {
+		fmt.Printf("%s %.2f %d %s\n", modelFor(o, it, attempt), left, o.cfg.Budget.ItemTimeoutMin*60, filepath.Join(rc.Path, filepath.FromSlash(it.Module)))
+		return nil
+	}
+	fmt.Println(pause)
+	exitCode = 4
+	if o.dryRun {
+		return nil
+	}
+	st.Status, st.Reason = "paused-budget", pause
+	st.log("run:paused-budget")
+	return saveState(o, st)
 }
 
 // cmdQueue prints the IDs of queued items, one per line, so a plain shell

@@ -6,6 +6,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -319,5 +320,96 @@ func TestFailingPkgsParsesOnlyPackageLines(t *testing.T) {
 	}
 	if got := strings.Join(failingPkgs(log), ","); got != "example.com/a,example.com/c" {
 		t.Errorf("failingPkgs = %q, want example.com/a,example.com/c", got)
+	}
+}
+
+func TestFinalizeTreatsQueuedItemsAsUnfinished(t *testing.T) {
+	items := func(statuses ...string) []Item {
+		var out []Item
+		for i, s := range statuses {
+			out = append(out, Item{ID: fmt.Sprint("i", i), Status: s})
+		}
+		return out
+	}
+	cases := []struct {
+		name, before, want, reason string
+		covered                    int
+		items                      []Item
+	}{
+		{"pilot left queued items", "in-progress", "in-progress", "2 queued item(s) not run yet", 50, items("done", "queued", "queued", "reserve")},
+		{"nothing run yet stays planned", "planned", "planned", "1 queued item(s) not run yet", 50, items("queued")},
+		{"budget pause is kept", "paused-budget", "paused-budget", "1 queued item(s) not run yet", 50, items("blocked", "queued")},
+		{"stale verdict from an earlier verify", "needs-replan", "in-progress", "1 queued item(s) not run yet", 50, items("queued")},
+		{"queue empty, reserve left", "in-progress", "needs-replan", "1 reserve package(s) untried", 50, items("done", "reserve")},
+		{"queue empty, nothing left", "in-progress", "not-achieved", "0 reserve package(s) untried", 50, items("done", "blocked")},
+		{"goal met with queued items", "in-progress", "achieved", "verified 90.00%", 90, items("done", "queued")},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			st := &RepoState{Goal: 80, Status: tc.before, Items: tc.items, Rows: []FileCov{{File: "a/a.go", Pkg: "a", Stmts: 100, Covered: tc.covered}}}
+			finalize(nil, st)
+			if st.Status != tc.want || !strings.Contains(st.Reason, tc.reason) {
+				t.Errorf("status %q reason %q; want %q with %q", st.Status, st.Reason, tc.want, tc.reason)
+			}
+		})
+	}
+}
+
+func TestVerifyBeforeAnyWorkReportsQueuedItems(t *testing.T) {
+	o, _ := newFixture(t, 95)
+	reportAndPlan(t, o)
+	mustRun(t, "verify", cmdVerify(context.Background(), o))
+	if st := state(t, o); st.Status != "planned" || !strings.Contains(st.Reason, "1 queued item(s) not run yet") {
+		t.Errorf("verify with the queue untouched: status %q reason %q; want planned, naming the queued item", st.Status, st.Reason)
+	}
+}
+
+func TestBeginBlocksPackageThatDoesNotBuild(t *testing.T) {
+	o, dir := newFixture(t, 95)
+	reportAndPlan(t, o)
+	writeFile(t, dir, "calc/broken.go", "package calc\n\nfunc Broken() int { return undefinedName }\n")
+	mustGit(t, dir, "add", "-A")
+	mustGit(t, dir, "-c", "user.email=t@example.com", "-c", "user.name=t", "commit", "-qm", "break calc")
+
+	exitCode = 0
+	mustRun(t, "begin", cmdBegin(context.Background(), o, calcItem))
+	code := exitCode
+	exitCode = 0
+	if code != 3 {
+		t.Errorf("begin on a package that does not build: exit %d, want 3", code)
+	}
+	if it := item(t, state(t, o), calcItem); it.Status != "blocked" || !strings.Contains(it.Reason, "does not build") {
+		t.Errorf("item = %s (%q), want blocked as not building - a queued item would be retried forever", it.Status, it.Reason)
+	}
+}
+
+func TestBeginDryRunChangesNothing(t *testing.T) {
+	o, dir := newFixture(t, 95)
+	o.cfg.Repos[0].Branch = "gocov-tests"
+	reportAndPlan(t, o)
+	writeFile(t, dir, "notes.txt", "uncommitted\n") // a real begin on a planned repo refuses this
+	before, err := os.ReadFile(statePath(o, "demo"))
+	mustRun(t, "read state", err)
+
+	o.dryRun, o.quiet = true, true
+	pp, _ := capture(t, "begin -dry-run", func() error { return cmdBegin(context.Background(), o, calcItem) })
+	prompt, err := os.ReadFile(pp)
+	mustRun(t, "read dry-run prompt", err)
+	if !strings.Contains(string(prompt), "Current package coverage: 60.0%") {
+		t.Errorf("dry-run prompt should show calc's real coverage (9/15); got:\n%s", prompt)
+	}
+	if after, _ := os.ReadFile(statePath(o, "demo")); string(after) != string(before) {
+		t.Error("begin -dry-run changed state.json")
+	}
+	if out, _ := git(dir, "branch", "--list", "gocov-tests"); strings.TrimSpace(out) != "" {
+		t.Error("begin -dry-run created the work branch")
+	}
+	if _, err := os.Stat(snapPath(o, o.cfg.Repos[0], &Item{ID: calcItem})); err == nil {
+		t.Error("begin -dry-run wrote a snapshot")
+	}
+
+	o.dryRun = false
+	if err := cmdBegin(context.Background(), o, calcItem); err == nil || !strings.Contains(err.Error(), "uncommitted") {
+		t.Errorf("real begin after a dry run: err = %v, want the clean-tree refusal (repo must still be planned)", err)
 	}
 }

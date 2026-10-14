@@ -10,7 +10,8 @@ Build once: `cd <skill-dir>/scripts/gocov && go build -o ../bin/gocov .` (add `.
 |---|---|---|
 | `gocov report` | Finds every `go.mod`, runs a full `-coverpkg=./...` baseline per repo, writes `COVERAGE_REPORT.md`, `state.json`, `SUMMARY.md`. Refuses to overwrite a repo that already has progress unless `-force`. | no |
 | `gocov plan` | Groups uncovered code by package, ranks by value score, queues only what the goal needs, writes `PLAN.md` (cost/time estimate, "goal likely unreachable" warning). Safe to re-run after progress (e.g. after a pilot): `done`/`blocked` items are kept, only the rest is re-ranked. | no |
-| `gocov begin -repo R -item ID [-q]` | Checks out the work branch, measures the package, snapshots the tree, writes and prints the task prompt (`-q`: print only the prompt file path). Refuses while any non-test file differs from HEAD (e.g. an unrestored mutation). | no |
+| `gocov begin -repo R -item ID [-q]` | Checks out the work branch, measures the package, snapshots the tree, writes and prints the task prompt (`-q`: print only the prompt file path). Refuses while any non-test file differs from HEAD (e.g. an unrestored mutation). **Exit 3 = the package does not build/test**: the item is marked blocked. With `-dry-run` it only writes `work/<id>.dry-run.prompt.md`: no state save, branch checkout or snapshot. | no |
+| `gocov next-call -repo R -item ID -attempt K [-spent USD] [-elapsed SEC]` | For fan-out scripts: prints `MODEL CAP_USD TIMEOUT_SEC WORKDIR` for the next `claude -p` call by the same rules as `gocov run` (`-spent`/`-elapsed` are the script's run totals). **Exit 4 = budget or time limit reached** (repo marked `paused-budget`, except with `-dry-run`), **5 = `max_attempts` used**. | no |
 | `gocov finish -repo R -item ID [-abandon] [-cost USD]` | Verifies what was written; accepts, returns feedback, or with `-abandon` reverts and blocks the item. **Exit code 0 = accepted, 3 = not accepted** (feedback printed and saved to `work/<id>.feedback.md`). | no |
 | `gocov queue -repo R` | Prints queued item IDs, one per line - for shell loops. | no |
 | `gocov goal -repo R` | Prints the running estimate; exit 0 if it has reached the goal, 10 if not. | no |
@@ -32,6 +33,7 @@ Common flags: `-config FILE` (multi-repo) or `-path DIR [-goal N] [-scope a,b]` 
 
 `queued` (will run) - `reserve` (ranked, not needed for the goal) - `done` - `blocked(reason)`.
 Repo statuses: `baselined` - `planned` - `in-progress` - `achieved` | `needs-replan` | `not-achieved` | `failing-tests` | `paused-budget` | `paused-error`.
+A verify below the goal with items still `queued` (after `-pilot`, a budget pause, or a script stopped early) does not judge the run: the repo stays `in-progress` (or `planned` / `paused-*`) with "N queued item(s) not run yet" - re-run to continue. `needs-replan` = queue empty, `reserve` packages untried; `not-achieved` = nothing left to try.
 `achieved` needs the goal met **and** no package failing that passed at baseline; packages already failing at baseline are named as pre-existing. `failing-tests` = goal may be met, but a package that was green at baseline now fails (listed in `FINAL_REPORT.md`).
 
 ## Config keys
