@@ -53,7 +53,7 @@ gocov run -config cfg.json -repo NAME    # one repo of the config
 gocov run -config cfg.json -commit       # one local commit per successful item (never pushes)
 ```
 
-Always pilot first, copy the observed `$ per item` into `est_usd_per_item`, re-run `gocov plan`, then approve the full run.
+Always pilot first, copy the observed `$ per item` into `est_usd_per_item`, re-run `gocov plan` (the pilot's done/blocked items are kept), then approve the full run.
 
 ## What the script enforces (not the model)
 

@@ -310,33 +310,48 @@ type HistoryEntry struct {
 }
 
 type RepoState struct {
-	Name          string           `json:"name"`
-	Path          string           `json:"path"`
-	Goal          float64          `json:"goal"`
-	GoalBasis     string           `json:"goal_basis"`
-	Scope         []string         `json:"scope"`
-	Modules       []Module         `json:"modules"`
-	Status        string           `json:"status"` // baselined | planned | in-progress | achieved | not-achieved | needs-replan | paused-budget | blocked
-	Reason        string           `json:"reason,omitempty"`
-	Warnings      []string         `json:"warnings,omitempty"`
-	BaseRaw       Totals           `json:"baseline_raw"`
-	BaseAdj       Totals           `json:"baseline_adjusted"`
-	BaseGoal      Totals           `json:"baseline_goal"`
-	Rows          []FileCov        `json:"rows"`
-	Items         []Item           `json:"items"`
-	SpendUSD      float64          `json:"spend_usd"`
-	Verified      bool             `json:"verified"` // last Current figure came from a fresh full run
-	History       []HistoryEntry   `json:"history"`
-	ComplexProd   []FuncComplexity `json:"complex_prod,omitempty"`
-	ComplexTests  []FuncComplexity `json:"complex_tests,omitempty"`
-	LintHints     []string         `json:"lint_hints,omitempty"`
-	BuildTagTests int              `json:"build_tagged_test_files"`
-	ProjectedPct  float64          `json:"plan_projected_pct,omitempty"`
+	Name          string              `json:"name"`
+	Path          string              `json:"path"`
+	Goal          float64             `json:"goal"`
+	GoalBasis     string              `json:"goal_basis"`
+	Scope         []string            `json:"scope"`
+	Modules       []Module            `json:"modules"`
+	Status        string              `json:"status"` // baselined | planned | in-progress | achieved | not-achieved | needs-replan | paused-budget | blocked
+	Reason        string              `json:"reason,omitempty"`
+	Warnings      []string            `json:"warnings,omitempty"`
+	BaseRaw       Totals              `json:"baseline_raw"`
+	BaseAdj       Totals              `json:"baseline_adjusted"`
+	BaseGoal      Totals              `json:"baseline_goal"`
+	Rows          []FileCov           `json:"rows"`
+	UncovBlocks   map[string][]UBlock `json:"uncovered_blocks"`           // nil only in state written before v2.5; goal-relevant uncovered blocks per file; the gain of an item is the stmts of these it newly hits
+	BaseFailing   []string            `json:"baseline_failing,omitempty"` // packages failing at baseline (pre-existing)
+	Failing       []string            `json:"failing,omitempty"`          // packages failing in the latest full run
+	Items         []Item              `json:"items"`
+	SpendUSD      float64             `json:"spend_usd"`
+	Verified      bool                `json:"verified"` // last Current figure came from a fresh full run
+	History       []HistoryEntry      `json:"history"`
+	ComplexProd   []FuncComplexity    `json:"complex_prod,omitempty"`
+	ComplexTests  []FuncComplexity    `json:"complex_tests,omitempty"`
+	LintHints     []string            `json:"lint_hints,omitempty"`
+	BuildTagTests int                 `json:"build_tagged_test_files"`
+	ProjectedPct  float64             `json:"plan_projected_pct,omitempty"`
 }
 
 // goalTotals is the figure the goal is judged against.
 func (s *RepoState) goalTotals() Totals {
 	return sumRows(s.Rows, s.Scope, s.GoalBasis != "raw")
+}
+
+// absorb adds one module's full-run measurement to the state.
+func (s *RepoState) absorb(m *Measurement) {
+	s.Rows = append(s.Rows, m.Rows...)
+	if s.UncovBlocks == nil {
+		s.UncovBlocks = map[string][]UBlock{}
+	}
+	for f, bs := range m.UncovB {
+		s.UncovBlocks[f] = bs
+	}
+	s.Failing = append(s.Failing, m.Failing...)
 }
 
 func (s *RepoState) log(event string) {
