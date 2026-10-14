@@ -11,6 +11,7 @@
 //	gocov status -config c.json     progress table
 //	gocov verify -config c.json     fresh full run, mark achieved / not achieved
 //	gocov mark   -repo R -item ID -status done|blocked   (interactive bookkeeping)
+//	gocov begin / finish / next-call / queue / goal      (building blocks for fan-out scripts)
 //
 // Single repo without a config file: gocov report -path DIR -goal 80 -scope a,b
 package main
@@ -145,7 +146,7 @@ func (o *opts) repos() []RepoCfg {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, `usage: gocov <report|plan|run|begin|finish|queue|goal|preflight|review|complexity|status|verify|mark> [flags]
+	fmt.Fprintln(os.Stderr, `usage: gocov <report|plan|run|begin|finish|next-call|queue|goal|preflight|review|complexity|status|verify|mark> [flags]
   -config FILE   JSON config (repos, goals, budgets). See references/batch-config-example.json
   -path DIR      single repo without a config file (use with -goal, -scope)
   -goal N        target coverage % for -path mode (default 60)
@@ -153,15 +154,19 @@ func usage() {
   -out DIR       output dir (default gocov-out)
   -repo NAME     only this repo from the config
   -pilot N       (run) only the first N queued items per repo; prints cost per item
-  -dry-run       (run) print the claude command + prompt for the first item, run nothing
+  -dry-run       (run) print the claude command + prompt for the first item, run nothing;
+                 (begin, next-call) print as usual but save no state, check out no branch, snapshot nothing
   -commit        (run) git-commit each successful item
   -force         (report) overwrite state that already has progress
   queue -repo R                          print queued item IDs, one per line (for scripts)
+  next-call -repo R -item ID -attempt K [-spent USD] [-elapsed SEC]
+                                         (scripts) print "MODEL CAP_USD TIMEOUT_SEC WORKDIR" for the next claude call,
+                                         from the config's models and budgets; exit 4 = budget/time limit reached, 5 = attempts used
   goal  -repo R                          exit 0 if the running estimate has reached the goal, 10 if not
   preflight                              check that claude -p can authenticate (exit 0/1)
   review -repo R [-headless]             adversarial review of the new tests: writes a packet for a fresh-context reviewer (or runs one claude -p)
   complexity -path DIR [-limit N]        list functions over the complexity limit (code and tests)
-  begin  -repo R -item ID [-q]            (-q prints only the prompt file path)
+  begin  -repo R -item ID [-q]            (-q prints only the prompt file path; exit 3 = package does not build/test, item blocked)
   begin  -repo R -item ID                 (in-session mode) snapshot + print the task prompt
   finish -repo R -item ID [-abandon] [-cost USD]   verify the tests the session wrote
   mark -repo R -item ID -status done|blocked|queued [-reason TEXT]   (interactive mode bookkeeping)`)
@@ -192,6 +197,9 @@ func main() {
 	limitF := fs.Int("limit", 0, "")
 	headlessF := fs.Bool("headless", false, "")
 	quietF := fs.Bool("q", false, "")
+	attemptF := fs.Int("attempt", 0, "")
+	spentF := fs.Float64("spent", 0, "")
+	elapsedF := fs.Int("elapsed", 0, "")
 	fs.Usage = usage
 	_ = fs.Parse(os.Args[2:])
 
@@ -243,6 +251,8 @@ func main() {
 		err = cmdStatus(o)
 	case "verify":
 		err = cmdVerify(ctx, o)
+	case "next-call":
+		err = cmdNextCall(o, *item, *attemptF, *spentF, *elapsedF)
 	case "queue":
 		err = cmdQueue(o)
 	case "goal":

@@ -2,7 +2,7 @@
 name: go-test-coverage
 description: Measures, plans and raises Go unit-test coverage to a goal (e.g. 60% or 80%) across one or many repos, folders or files, while keeping every function it writes under a complexity limit (default 15). Always produces a coverage report first, ranks packages by uncovered statements, gets the plan approved, then writes real behavior-verifying table-driven tests (never padding stubs), reports progress after every package, and marks each repo achieved only after a fresh full run verifies the goal. Works inside Claude Desktop/CLI with no extra login, or headless with `claude -p` and cost caps for large batches. Use when the user says "improve/increase test coverage", "get coverage to 60/80%", "write unit tests for this Go package/repo(s)", "coverage report for Go repos", or "keep complexity under 15" for Go code.
 metadata:
-  version: 2.5.0
+  version: 2.6.0
 ---
 
 # Go Test Coverage

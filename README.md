@@ -30,11 +30,13 @@ Then ask Claude Code something like *"get coverage of ./myrepo to 80%"*.
 A child `claude -p` cannot reuse the Claude Desktop or session login. It needs the standalone CLI logged in (`claude auth status`) or `ANTHROPIC_API_KEY`.
 
 ```bash
-scripts/fanout.sh  -c cfg.json -r REPO -d /path/to/repo -n 3     # pilot: first 3 packages, prints real cost
+scripts/fanout.sh  -c cfg.json -r REPO -n 3     # pilot: first 3 packages, prints real cost
 ```
 ```powershell
-scripts\fanout.ps1 -Config cfg.json -Repo REPO -Dir C:\path\to\repo -Pilot 3
+scripts\fanout.ps1 -Config cfg.json -Repo REPO -Pilot 3
 ```
+
+The repo path, models, spend caps, attempts and timeouts all come from the config (`references/batch-config-example.json`), the same rules `gocov run` applies.
 
 Run `gocov report` and `gocov plan` first (see `SKILL.md`). Config template: `references/batch-config-example.json`.
 

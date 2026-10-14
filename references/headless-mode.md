@@ -3,9 +3,9 @@
 One fresh `claude -p` per package, driven by a script - the "fan out across files" pattern from Claude Code's best-practices guide. **A script, not a model, runs the loop and the commands.** Two equivalent drivers:
 
 - `scripts/fanout.sh` / `scripts/fanout.ps1` - short, readable loops you can edit (recommended).
-- `gocov run` - the same loop built into the Go engine, with extras (parallel repos, escalation heuristics, per-repo/total/time budgets).
+- `gocov run` - the same loop built into the Go engine; it adds parallel repos (`jobs`) and `-commit`.
 
-Both start one fresh `claude -p` per package. Use it when nobody is watching or the batch is too large for one conversation. Inside Claude Desktop / CLI prefer `in-session-mode.md`.
+Both start one fresh `claude -p` per package and apply the same rules from the same config: models and escalation, per-call/repo/run caps, `time_limit_min`, `item_timeout_min`, `max_attempts`, blocking packages that do not build, and verifying before stopping early. The scripts get them from `gocov next-call`, so the rules live in one place. Use it when nobody is watching or the batch is too large for one conversation. Inside Claude Desktop / CLI prefer `in-session-mode.md`.
 
 ## Authentication - read this first
 
@@ -22,26 +22,27 @@ Prerequisite: `gocov report` and `gocov plan` done and the plan approved (the sc
 
 ```bash
 # bash / Git Bash / WSL / macOS / Linux
-scripts/fanout.sh -c cfg.json -r REPO -d /path/to/repo -n 3        # pilot: first 3 items
-scripts/fanout.sh -c cfg.json -r REPO -d /path/to/repo -t 10 -v    # everything, $10 cap, headless review at the end
-scripts/fanout.sh -c cfg.json -r REPO -d /path/to/repo --dry-run   # print the claude command + prompt only
+scripts/fanout.sh -c cfg.json -r REPO -n 3        # pilot: first 3 items
+scripts/fanout.sh -c cfg.json -r REPO -v          # everything queued, headless review at the end
+scripts/fanout.sh -c cfg.json -r REPO --dry-run   # print the claude command + prompt only
 ```
 
 ```powershell
 # Windows PowerShell
-scripts\fanout.ps1 -Config C:\work\cfg.json -Repo REPO -Dir C:\work\repo -Pilot 3
-scripts\fanout.ps1 -Config C:\work\cfg.json -Repo REPO -Dir C:\work\repo -TotalUsd 10 -Review
+scripts\fanout.ps1 -Config C:\work\cfg.json -Repo REPO -Pilot 3
+scripts\fanout.ps1 -Config C:\work\cfg.json -Repo REPO -Review
 ```
 
-Options: model (attempt 1), escalation model (later attempts), max attempts (2), per-call USD cap (1.50), total USD cap (10), pilot N, review, dry-run. The loop is, per queued item:
+Options: pilot N, review, dry-run (prints the first item's claude command and prompt; it saves no state, checks out no branch and leaves the tree alone, so the real run still starts from a clean tree on the work branch). Everything else comes from the config (`models`, `budget`, `max_attempts`); to spend less, lower `budget.max_usd_total` there. The loop is, per queued item:
 
-1. `gocov goal` - stop when the running estimate already reaches the goal.
-2. `gocov begin -q` - snapshot the tree, print only the prompt file path.
-3. `claude -p --output-format json --permission-mode dontAsk --max-budget-usd N --no-session-persistence --allowedTools "<pre-approved list>" < prompt` run inside the repo.
-4. `gocov finish -cost <spent>` - exit 0 = accepted; **exit 3 = rejected, feedback is in `work/<id>.feedback.md`** and is appended to the next attempt's prompt (with the escalation model); after the last attempt `gocov finish -abandon` reverts and blocks the item.
-5. After the loop: `gocov verify` (fresh full run), optional `gocov review -headless`.
+1. `gocov goal` - when the running estimate reaches the goal, `gocov verify`; stop if the verified figure meets it, otherwise carry on (as `gocov run` does).
+2. `gocov next-call -item ID -attempt K -spent USD -elapsed SEC` - prints `MODEL CAP_USD TIMEOUT_SEC WORKDIR`: `models.default`, or `models.escalate` on a retry, for cgo/exec/syscall code, or above 300 uncovered statements; the cap is the smallest of the per-item cap and what is left of the repo and run budgets. **Exit 4 = budget or time limit reached** (the repo becomes `paused-budget`, remaining items stay queued, the script stops); **exit 5 = `max_attempts` used** (the script abandons the item).
+3. `gocov begin -q` - snapshot the tree, print only the prompt file path. **Exit 3 = the package does not build/test**: gocov marks it blocked and the script moves on.
+4. `claude -p --output-format json --model MODEL --permission-mode dontAsk --max-budget-usd CAP --no-session-persistence --allowedTools "<pre-approved list>" < prompt`, run in the item's module dir and killed after TIMEOUT_SEC (`item_timeout_min`) so a hung call cannot block the run.
+5. `gocov finish -cost <spent>` - exit 0 = accepted; **exit 3 = rejected, feedback is in `work/<id>.feedback.md`** and is appended to the next attempt's prompt; when next-call says the attempts are used, `gocov finish -abandon` reverts and blocks the item. If the budget runs out mid-item the item is abandoned and the run stops, as in `gocov run`.
+6. After the loop: `gocov verify` (fresh full run; skipped if step 1 already verified the goal), optional `gocov review -headless`.
 
-The scripts first run `gocov preflight`, so a missing login fails in seconds. If `claude -p` returns an error without spending anything (auth/API), the script exits and the item stays queued. Helper commands for your own scripts: `gocov queue` (queued IDs), `gocov goal` (exit 0 reached / 10 not), `gocov preflight`, `gocov begin -q`, `gocov finish` (exit 3 = not accepted).
+The scripts first run `gocov preflight`, so a missing login fails in seconds. If `claude -p` returns an error without spending anything (auth/API), the script exits and the item stays queued. Helper commands for your own scripts: `gocov queue` (queued IDs), `gocov goal` (exit 0 reached / 10 not), `gocov next-call` (model, cap, timeout, work dir; exit 4 stop / 5 attempts used), `gocov preflight`, `gocov begin -q` (exit 3 = blocked), `gocov finish` (exit 3 = not accepted).
 
 ## `gocov run` commands
 
@@ -60,7 +61,7 @@ Always pilot first, copy the observed `$ per item` into `est_usd_per_item`, re-r
 - Permissions: the documented unattended pattern - `--allowedTools` pre-approves only `Read, Edit, Write, Glob, Grep` and the `go test|vet|build|list`, `gofmt`, `git diff|status` shell commands, and `--permission-mode dontAsk` denies everything else instead of prompting. The script, not the prompt, is the safety boundary.
 - One package per call; the prompt is only the package path, uncovered line ranges and the rules.
 - Model: `models.default` first; `models.escalate` on retry, for cgo/exec/syscall code, or packages with more than 300 uncovered statements.
-- Budgets: `--max-budget-usd` per call (the smaller of per-item cap, repo remaining, run remaining) plus `max_usd_per_repo`, `max_usd_total`, `time_limit_min`, `item_timeout_min`. At a cap the repo pauses as `paused-budget`; raise the cap and re-run to resume. This `claude` version has no `--max-turns`; the USD cap and timeout bound each call.
+- Budgets: `--max-budget-usd` per call (the smallest of per-item cap, repo remaining, run remaining, in whole cents) plus `max_usd_per_repo`, `max_usd_total`, `time_limit_min` (checked before each item), `item_timeout_min` (each call is killed after it). At a cap the repo pauses as `paused-budget`; raise the cap and re-run to resume. "Run" means one `gocov run` or one script invocation; repo spend is kept in `state.json` across runs. This `claude` version has no `--max-turns`; the USD cap and timeout bound each call.
 - Only `_test.go` and `testdata/` edits survive. Production edits and `go.mod`/`go.sum` (unless `allow_deps`) are reverted automatically; failed items are cleaned out of the tree.
 - Acceptance per item: tests green, no new over-limit function (`complexity.md`), `-count=3` flake check, at least one newly covered statement. Max `max_attempts` (default 2) then `blocked(reason)`.
 - Early stop: when the running estimate reaches the goal it runs a fresh full verify; if the verified number is below goal it carries on.
@@ -72,5 +73,6 @@ Deterministic work is script-only; estimate shown at `plan`; pilot before bulk; 
 
 ## Limits worth knowing
 
+- A call killed at the timeout reports no cost, so its spend is not counted against the budgets.
 - In-flight coverage is an estimate until `gocov verify` (or the early-stop verify) replaces it with a fresh full run.
 - `-race` needs cgo; set `race: true` only where a C toolchain exists.

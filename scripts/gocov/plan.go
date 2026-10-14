@@ -568,10 +568,17 @@ func (s *RepoState) newFailures() []string {
 	return out
 }
 
-// finalize sets the terminal status from a VERIFIED measurement. A repo is
-// achieved only if the goal is met AND no package fails that passed at baseline.
+// finalize sets the status from a VERIFIED measurement. A repo is achieved
+// only if the goal is met AND no package fails that passed at baseline. Below
+// the goal with queued items left (a pilot, a budget pause, a driver stopped
+// early) the run is unfinished, not failed.
 func finalize(o *opts, st *RepoState) {
 	pct := st.goalTotals().Pct()
+	counts := map[string]int{}
+	for _, it := range st.Items {
+		counts[it.Status]++
+	}
+	reserve, blocked, queued := counts["reserve"], counts["blocked"], counts["queued"]
 	switch {
 	case len(st.newFailures()) > 0:
 		st.Status, st.Reason = "failing-tests", fmt.Sprintf("verified %.2f%% (goal %.0f%%) but tests now fail in %s, which passed at baseline - fix them before calling this done", pct, st.Goal, strings.Join(st.newFailures(), ", "))
@@ -580,16 +587,16 @@ func finalize(o *opts, st *RepoState) {
 		if len(st.Failing) > 0 {
 			st.Reason += fmt.Sprintf("; still failing as at baseline (pre-existing, not caused by new tests): %s", strings.Join(st.Failing, ", "))
 		}
-	default:
-		reserve, blocked := 0, 0
-		for _, it := range st.Items {
-			switch it.Status {
-			case "reserve":
-				reserve++
-			case "blocked":
-				blocked++
-			}
+	case queued > 0:
+		// planned (begin/run still require a clean tree and check out the
+		// branch) and paused-* (the cause still holds) stay as they are.
+		switch st.Status {
+		case "planned", "paused-budget", "paused-error":
+		default:
+			st.Status = "in-progress"
 		}
+		st.Reason = fmt.Sprintf("verified %.2f%% < goal %.0f%%; %d queued item(s) not run yet, %d done, %d blocked - re-run `gocov run` or the fan-out script to continue", pct, st.Goal, queued, counts["done"], blocked)
+	default:
 		st.Status = "not-achieved"
 		st.Reason = fmt.Sprintf("verified %.2f%% < goal %.0f%%; %d reserve package(s) untried, %d blocked (see FINAL_REPORT.md)", pct, st.Goal, reserve, blocked)
 		if reserve > 0 {
