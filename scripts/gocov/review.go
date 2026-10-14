@@ -19,7 +19,6 @@ import (
 	"regexp"
 	"sort"
 	"strings"
-	"time"
 )
 
 func reviewDir(o *opts, name string) string  { return filepath.Join(repoDir(o, name), "review") }
@@ -155,7 +154,7 @@ func runHeadlessReview(ctx context.Context, o *opts, rc RepoCfg, st *RepoState, 
 	if usd < 0.05 {
 		return fmt.Errorf("%s: no budget left for the review step", rc.Name)
 	}
-	cctx, cancel := context.WithTimeout(ctx, time.Duration(o.cfg.Budget.ItemTimeoutMin)*time.Minute)
+	cctx, cancel := context.WithTimeout(ctx, o.cfg.itemTimeout())
 	defer cancel()
 	args := []string{
 		"-p", "--output-format", "json",
@@ -170,7 +169,15 @@ func runHeadlessReview(ctx context.Context, o *opts, rc RepoCfg, st *RepoState, 
 	cmd.Stdin = strings.NewReader(prompt)
 	var out, errb bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &out, &errb
+	cmd.WaitDelay = waitDelay
 	_ = cmd.Run()
+	if killedAtTimeout(cctx) {
+		st.SpendUSD += usd
+		if err := saveState(o, st); err != nil {
+			return err
+		}
+		return fmt.Errorf("%s: headless review killed at the %v item_timeout_min; charged its cap $%.2f (a killed call reports no cost)", rc.Name, o.cfg.itemTimeout(), usd)
+	}
 	var res claudeResult
 	if err := json.Unmarshal(out.Bytes(), &res); err != nil || res.IsError {
 		return fmt.Errorf("%s: headless review failed: %s %s", rc.Name, firstLine(res.Result), firstLine(errb.String()))

@@ -7,7 +7,7 @@ A [Claude Code skill](https://code.claude.com/docs/en/skills) that raises Go uni
 1. **Report first** - measures coverage per repo (`-coverpkg=./...`), ranks files and packages by uncovered statements. No tests are written yet.
 2. **Plan** - queues only the packages the goal needs, with a cost estimate and a warning if the goal looks unreachable. One approval gate.
 3. **Write tests** - table-driven, deterministic, mutation-checked; only `_test.go` files change. Either inside a Claude Code session (no extra login) or headless with a script that loops over `claude -p`, one fresh call per package.
-4. **Guard rails** (enforced by a script, not the model) - non-test edits are reverted, tests must be green and stable (`-count=3`), new functions over the complexity limit are rejected, and each package must show real new coverage.
+4. **Guard rails** (enforced by a script, not the model) - non-test edits are reverted, tests must be green, stable and order-independent (`-count=3 -shuffle=on`) and `go vet` clean, new functions over the complexity limit are rejected, and each package must show real new coverage.
 5. **Adversarial review** - a fresh-context, read-only reviewer looks for tests that would not catch a real regression.
 6. **Verify and close** - a repo is marked `achieved` only after a fresh full run meets the goal.
 

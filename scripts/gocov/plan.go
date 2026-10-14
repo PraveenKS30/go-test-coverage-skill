@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -522,8 +523,13 @@ func fullMeasure(ctx context.Context, o *opts, st *RepoState, rc RepoCfg, tag st
 	}
 	applyExcludes(st, rc)
 	st.Verified = true
+	fullRuns.Add(1)
 	return nil
 }
+
+// fullRuns counts the fresh full runs this process made (tests check that a
+// verified result is reused instead of measured twice).
+var fullRuns atomic.Int64
 
 func cmdVerify(ctx context.Context, o *opts) error {
 	for _, rc := range o.repos() {
