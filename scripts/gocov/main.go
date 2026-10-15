@@ -37,22 +37,38 @@ type RepoCfg struct {
 	Exclude     []string `json:"exclude"`    // extra globs of MACHINE-GENERATED files only
 	Branch      string   `json:"branch"`     // work branch for generated tests (git repos)
 	AllowNonGit bool     `json:"allow_non_git"`
+
+	tag string // console prefix of an item's lines ("demo w3"); the name when empty
+}
+
+// label is the console prefix for rc's lines: the repo name, plus the worker
+// slot while an item runs.
+func (rc RepoCfg) label() string {
+	if rc.tag != "" {
+		return rc.tag
+	}
+	return rc.Name
+}
+
+type BudgetCfg struct {
+	MaxUSDTotal    float64 `json:"max_usd_total"`
+	MaxUSDPerRepo  float64 `json:"max_usd_per_repo"`
+	MaxUSDPerItem  float64 `json:"max_usd_per_item"`
+	ItemTimeoutMin float64 `json:"item_timeout_min"` // fractions allowed (0.5 = 30s)
+	TimeLimitMin   int     `json:"time_limit_min"`
+}
+
+type ModelsCfg struct {
+	Default  string `json:"default"`
+	Escalate string `json:"escalate"`
 }
 
 type Config struct {
-	OutDir string `json:"out_dir"`
-	Jobs   int    `json:"jobs"` // repos processed in parallel
-	Budget struct {
-		MaxUSDTotal    float64 `json:"max_usd_total"`
-		MaxUSDPerRepo  float64 `json:"max_usd_per_repo"`
-		MaxUSDPerItem  float64 `json:"max_usd_per_item"`
-		ItemTimeoutMin float64 `json:"item_timeout_min"` // fractions allowed (0.5 = 30s)
-		TimeLimitMin   int     `json:"time_limit_min"`
-	} `json:"budget"`
-	Models struct {
-		Default  string `json:"default"`
-		Escalate string `json:"escalate"`
-	} `json:"models"`
+	OutDir           string    `json:"out_dir"`
+	Jobs             int       `json:"jobs"`     // repos processed in parallel
+	Parallel         int       `json:"parallel"` // items of one repo in parallel (gocov run), one cap across all repos
+	Budget           BudgetCfg `json:"budget"`
+	Models           ModelsCfg `json:"models"`
 	MaxComplexity    int       `json:"max_complexity"`      // per-function limit, default 15; -1 disables
 	ComplexityMetric string    `json:"complexity_metric"`   // cyclomatic | cognitive | both (default)
 	MinUncovered     int       `json:"min_uncovered_stmts"` // skip packages with fewer uncovered stmts
@@ -71,6 +87,9 @@ func (c *Config) defaults() {
 	}
 	if c.Jobs <= 0 {
 		c.Jobs = 2
+	}
+	if c.Parallel <= 0 {
+		c.Parallel = 1
 	}
 	if c.Budget.MaxUSDTotal == 0 {
 		c.Budget.MaxUSDTotal = 20
@@ -151,7 +170,7 @@ func (o *opts) repos() []RepoCfg {
 }
 
 func usage() {
-	fmt.Fprintln(os.Stderr, `usage: gocov <report|plan|run|begin|finish|next-call|queue|goal|preflight|review|complexity|status|verify|mark> [flags]
+	fmt.Fprintln(os.Stderr, `usage: gocov <report|plan|run|begin|finish|next-call|queue|goal|preflight|review|complexity|status|verify|mark|run-start|run-end> [flags]
   -config FILE   JSON config (repos, goals, budgets). See references/batch-config-example.json
   -path DIR      single repo without a config file (use with -goal, -scope)
   -goal N        target coverage % for -path mode (default 60)
@@ -161,7 +180,9 @@ func usage() {
   -pilot N       (run) only the first N queued items per repo; prints cost per item
   -dry-run       (run) print the claude command + prompt for the first item, run nothing;
                  (begin, next-call) print as usual but save no state, check out no branch, snapshot nothing
-  -commit        (run) git-commit each successful item
+  -commit        (run) git-commit each successful item (always on with -parallel > 1)
+  -parallel N    (run) packages of one repo worked at once, each in its own git worktree;
+                 one cap across all repos (default: config "parallel", else 1)
   -force         (report) overwrite state that already has progress
   queue -repo R                          print queued item IDs, one per line (for scripts)
   next-call -repo R -item ID -attempt K [-spent USD] [-elapsed SEC]
@@ -173,7 +194,9 @@ func usage() {
   complexity -path DIR [-limit N]        list functions over the complexity limit (code and tests)
   begin  -repo R -item ID [-q]            (-q prints only the prompt file path; exit 3 = package does not build/test, item blocked)
   begin  -repo R -item ID                 (in-session mode) snapshot + print the task prompt
-  finish -repo R -item ID [-abandon] [-cost USD]   verify the tests the session wrote
+  finish -repo R -item ID [-abandon] [-cost USD] [-model M] [-cap USD]   verify the tests the session wrote
+  run-start -repo R -driver NAME         (scripts) open a run record, print its ID (export it as GOCOV_RUN_ID)
+  run-end   -repo R -run ID              (scripts) close the run record: times, measured concurrency
   mark -repo R -item ID -status done|blocked|queued [-reason TEXT]   (interactive mode bookkeeping)`)
 }
 
@@ -205,6 +228,11 @@ func main() {
 	attemptF := fs.Int("attempt", 0, "")
 	spentF := fs.Float64("spent", 0, "")
 	elapsedF := fs.Int("elapsed", 0, "")
+	parallelF := fs.Int("parallel", 0, "")
+	modelF := fs.String("model", "", "")
+	capF := fs.Float64("cap", 0, "")
+	driverF := fs.String("driver", "", "")
+	runF := fs.String("run", "", "")
 	fs.Usage = usage
 	_ = fs.Parse(os.Args[2:])
 
@@ -231,6 +259,9 @@ func main() {
 	cfg.defaults()
 	if *out != "" {
 		cfg.OutDir = *out
+	}
+	if *parallelF > 0 {
+		cfg.Parallel = *parallelF
 	}
 	for i := range cfg.Repos {
 		abs, err := filepath.Abs(cfg.Repos[i].Path)
@@ -271,7 +302,11 @@ func main() {
 	case "begin":
 		err = cmdBegin(ctx, o, *item)
 	case "finish":
-		err = cmdFinish(ctx, o, *item, *abandon, *costF)
+		err = cmdFinish(ctx, o, *item, *abandon, *costF, *modelF, *capF)
+	case "run-start":
+		err = cmdRunStart(o, *driverF)
+	case "run-end":
+		err = cmdRunEnd(o, *runF)
 	case "mark":
 		err = cmdMark(o, *item, *mstatus, *reason)
 	default:
@@ -316,6 +351,30 @@ type Item struct {
 	PkgAfter      float64  `json:"pkg_after_pct"`
 	Gained        int      `json:"stmts_gained"`
 	TestFiles     []string `json:"test_files,omitempty"`
+
+	// where and when the item was last worked (run tracking)
+	Run        string    `json:"run,omitempty"`         // RunRecord.ID
+	StartedAt  string    `json:"started_at,omitempty"`  // RFC 3339; set while it runs, FinishedAt empty
+	FinishedAt string    `json:"finished_at,omitempty"` // when its worker finished
+	Wave       int       `json:"wave,omitempty"`
+	Worker     int       `json:"worker,omitempty"` // worker slot, 1..parallel
+	Worktree   string    `json:"worktree,omitempty"`
+	Branch     string    `json:"branch,omitempty"`
+	MergeSHA   string    `json:"merge_sha,omitempty"` // its commit on the work branch
+	AttemptLog []Attempt `json:"attempt_log,omitempty"`
+}
+
+// Attempt is one claude call (or one finish of an in-session attempt).
+type Attempt struct {
+	N       int     `json:"n"`
+	Run     string  `json:"run,omitempty"`
+	Worker  int     `json:"worker,omitempty"`
+	Model   string  `json:"model,omitempty"`
+	CapUSD  float64 `json:"cap_usd,omitempty"`
+	CostUSD float64 `json:"cost_usd"`
+	Started string  `json:"started,omitempty"`
+	Ended   string  `json:"ended,omitempty"`
+	Error   string  `json:"error,omitempty"`
 }
 
 type HistoryEntry struct {
@@ -350,6 +409,9 @@ type RepoState struct {
 	LintHints     []string            `json:"lint_hints,omitempty"`
 	BuildTagTests int                 `json:"build_tagged_test_files"`
 	ProjectedPct  float64             `json:"plan_projected_pct,omitempty"`
+	Runs          []RunRecord         `json:"runs,omitempty"` // one per invocation of a driver
+
+	partial bool // a parallel worker's private view of one item (workerView), never saved
 }
 
 // goalTotals is the figure the goal is judged against.
@@ -395,5 +457,12 @@ func saveState(o *opts, s *RepoState) error {
 	if err := os.WriteFile(tmp, data, 0o644); err != nil {
 		return err
 	}
-	return os.Rename(tmp, statePath(o, s.Name))
+	var err error
+	for i := 0; i < 5; i++ { // on Windows a reader (gocov status) holding the file makes the rename fail briefly
+		if err = os.Rename(tmp, statePath(o, s.Name)); err == nil {
+			return nil
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return err
 }

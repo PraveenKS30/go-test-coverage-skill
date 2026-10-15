@@ -4,3 +4,7 @@ scripts/bin/
 # run output
 gocov-out/
 *.out
+
+# `go build` in scripts/gocov
+scripts/gocov/gocov
+scripts/gocov/gocov.exe

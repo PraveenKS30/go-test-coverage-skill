@@ -34,15 +34,90 @@ func say(format string, a ...any) {
 }
 
 // budget is the run-wide spend and time limit, shared by the repos run in
-// parallel (jobs > 1). A call's cap is reserved before it starts and settled to
-// its real cost after, so two repos can never be granted the same dollars.
+// parallel (jobs > 1) and the items run in parallel (parallel > 1). A call's
+// cap is reserved before it starts and settled to its real cost after, so two
+// calls can never be granted the same dollars. It also holds the rate-limit
+// back-off that every worker waits out.
 type budget struct {
-	mu       sync.Mutex
-	spent    float64 // settled: what finished calls cost
-	reserved float64 // caps of calls still running
-	deadline time.Time
-	cfg      *Config
+	mu         sync.Mutex
+	spent      float64 // settled: what finished calls cost
+	reserved   float64 // caps of calls still running
+	deadline   time.Time
+	cfg        *Config
+	pauseUntil time.Time // rate-limit back-off: no call starts before this
 }
+
+// repoAcct is one repo's spend in this run, guarded by budget.mu: its items
+// may run in parallel, so its cap is reserved and settled like the run's.
+type repoAcct struct{ spent, reserved float64 }
+
+// reserveFor reserves the next call's cap against the run and the repo.
+func (b *budget) reserveFor(r *repoAcct) (float64, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	left := callCap(b.cfg, r.spent+r.reserved, b.spent+b.reserved)
+	if left < minCallUSD {
+		return left, false
+	}
+	b.reserved += left
+	r.reserved += left
+	return left, true
+}
+
+// settleFor releases a reservation made by reserveFor and charges the cost.
+func (b *budget) settleFor(r *repoAcct, reserved, cost float64) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.reserved -= reserved
+	b.spent += cost
+	r.reserved -= reserved
+	r.spent += cost
+}
+
+// nextCap is the cap a call starting now would get.
+func (b *budget) nextCap(r *repoAcct) float64 {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return callCap(b.cfg, r.spent+r.reserved, b.spent+b.reserved)
+}
+
+func (b *budget) repoSpent(r *repoAcct) float64 {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return r.spent
+}
+
+// backoff holds back every new call for d (a rate limit is account-wide).
+func (b *budget) backoff(d time.Duration) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if until := time.Now().Add(d); until.After(b.pauseUntil) {
+		b.pauseUntil = until
+	}
+}
+
+// waitGate waits out a back-off another worker started.
+func (b *budget) waitGate(ctx context.Context) {
+	for {
+		b.mu.Lock()
+		d := time.Until(b.pauseUntil)
+		b.mu.Unlock()
+		if d <= 0 {
+			return
+		}
+		select {
+		case <-time.After(d):
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+// rateBackoff is the first rate-limit back-off; it doubles up to maxBackoffs
+// times for one attempt, then the repo pauses.
+var rateBackoff = 30 * time.Second
+
+const maxBackoffs = 3
 
 func (b *budget) runSpent() float64 {
 	b.mu.Lock()
@@ -58,32 +133,31 @@ func (b *budget) committed() float64 {
 	return b.spent + b.reserved
 }
 
-// reserve computes the next call's cap against the committed run spend and,
-// if it is at least minCallUSD, holds it until settle. It returns the cap and
-// whether it was reserved.
+// reserve computes the next call's cap against the committed run spend and a
+// repo spend of repoSpent and, if it is at least minCallUSD, holds it until
+// settle. It returns the cap and whether it was reserved.
 func (b *budget) reserve(repoSpent float64) (float64, bool) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	left := callCap(b.cfg, repoSpent, b.spent+b.reserved)
-	if left < minCallUSD {
-		return left, false
-	}
-	b.reserved += left
-	return left, true
+	return b.reserveFor(&repoAcct{spent: repoSpent})
 }
 
 // settle releases a reservation and charges what the call actually cost.
 func (b *budget) settle(reserved, cost float64) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	b.reserved -= reserved
-	b.spent += cost
+	b.settleFor(&repoAcct{}, reserved, cost)
 }
 func (b *budget) timeUp() bool {
 	return !b.deadline.IsZero() && time.Now().After(b.deadline)
 }
 
+// runTrack is what the repos of one `gocov run` share besides the budget.
+type runTrack struct {
+	id, driver string
+	pool       *workerPool // the global cap of parallel items, across all repos
+}
+
 func cmdRun(ctx context.Context, o *opts) error {
+	if o.cfg.Parallel > 1 && o.cfg.AllowDeps {
+		return fmt.Errorf("allow_deps cannot be combined with parallel > 1: items in separate worktrees editing go.mod/go.sum would conflict when merged; set parallel to 1 or allow_deps to false")
+	}
 	if _, err := exec.LookPath("claude"); err != nil && !o.dryRun {
 		return fmt.Errorf("`claude` CLI not found on PATH (needed for headless mode)")
 	}
@@ -96,6 +170,10 @@ func cmdRun(ctx context.Context, o *opts) error {
 	if o.cfg.Budget.TimeLimitMin > 0 {
 		b.deadline = time.Now().Add(time.Duration(o.cfg.Budget.TimeLimitMin) * time.Minute)
 	}
+	rt := &runTrack{id: newRunID(), driver: driverRun, pool: newPool(o.cfg.Parallel)}
+	if o.cfg.Parallel > 1 && !o.dryRun {
+		defer throttleGo(o.cfg.Parallel)()
+	}
 	sem := make(chan struct{}, o.cfg.Jobs)
 	var wg sync.WaitGroup
 	errs := make(chan error, len(o.cfg.Repos))
@@ -105,7 +183,7 @@ func cmdRun(ctx context.Context, o *opts) error {
 		go func(rc RepoCfg) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			if err := runRepo(ctx, o, rc, b); err != nil {
+			if err := runRepo(ctx, o, rc, b, rt); err != nil {
 				errs <- fmt.Errorf("%s: %w", rc.Name, err)
 			}
 		}(rc)
@@ -127,7 +205,7 @@ func cmdRun(ctx context.Context, o *opts) error {
 	return nil
 }
 
-func runRepo(ctx context.Context, o *opts, rc RepoCfg, b *budget) error {
+func runRepo(ctx context.Context, o *opts, rc RepoCfg, b *budget, rt *runTrack) (err error) {
 	st, err := loadState(o, rc.Name)
 	if err != nil {
 		return err
@@ -140,73 +218,55 @@ func runRepo(ctx context.Context, o *opts, rc RepoCfg, b *budget) error {
 		return nil
 	}
 	git := isGit(rc.Path)
+	parallel := o.cfg.Parallel > 1
+	if !git && !o.dryRun && parallel {
+		return fmt.Errorf("%s is not a git repo; parallel > 1 needs git (each item works in its own worktree)", rc.Path)
+	}
 	if !git && !rc.AllowNonGit && !o.dryRun {
 		return fmt.Errorf("%s is not a git repo; refusing to let an agent edit it without a way to revert (set allow_non_git:true to override)", rc.Path)
 	}
-	if git && !o.dryRun && st.Status == "planned" {
+	if git && !o.dryRun && (st.Status == "planned" || parallel) {
 		if dirty := dirtyFiles(rc.Path, o.cfg.OutDir); len(dirty) > 0 {
+			if parallel {
+				return fmt.Errorf("working tree has uncommitted changes (%d files, e.g. %s); parallel > 1 merges each item as a commit onto the work branch, so commit or stash them first", len(dirty), dirty[0])
+			}
 			return fmt.Errorf("working tree has uncommitted changes (%d files, e.g. %s); commit or stash first so generated work is cleanly separable", len(dirty), dirty[0])
 		}
-		if rc.Branch != "" {
+		if st.Status == "planned" && rc.Branch != "" {
 			if err := gitCheckoutBranch(rc.Path, rc.Branch); err != nil {
 				return err
 			}
 		}
 	}
+	acct := &repoAcct{spent: st.SpendUSD}
+	if o.dryRun {
+		return runDryRun(ctx, o, rc, st, b, acct)
+	}
 
-	processed := 0
-	fresh := false // st holds a full run made after the last item: close-out reuses it
-	for i := range st.Items {
-		it := &st.Items[i]
-		if it.Status != "queued" {
-			continue
-		}
-		if o.pilot > 0 && processed >= o.pilot {
-			st.Status = "in-progress"
-			st.Reason = fmt.Sprintf("pilot of %d item(s) finished; re-run without -pilot to continue", o.pilot)
-			break
-		}
-		if b.timeUp() {
-			st.Status, st.Reason = "paused-budget", "time limit reached; re-run to resume"
-			break
-		}
-		left := callCap(o.cfg, st.SpendUSD, b.committed())
-		if left < minCallUSD {
-			st.Status, st.Reason = "paused-budget", budgetReason(o.cfg, left, st.SpendUSD, b.committed())
-			break
-		}
-		if o.dryRun {
-			prompt, err := dryRunPrompt(ctx, o, rc, st, it)
-			if err != nil {
-				return err
-			}
-			say("---- DRY RUN (%s, item %s) ----\ncommand: %s\n\n%s", rc.Name, it.ID, claudeArgsString(o, modelFor(o, it, 1), left), prompt)
-			return nil
-		}
-		st.Status = "in-progress"
-		st.Reason = ""
-		processed++
-		fresh = false
-		if ferr := runItem(ctx, o, rc, st, it, b, git); ferr != nil {
-			st.Status, st.Reason = "paused-error", ferr.Error()
+	now := time.Now()
+	st.resetInterrupted()
+	st.addRun(o, rt.id, rt.driver, o.cfg.Parallel, now)
+	ev := newEventLog(o, rc.Name, rt.id)
+	ev.emitAt(now, "run-start", runStartFields(st.runByID(rt.id)))
+	if err := saveState(o, st); err != nil {
+		return err
+	}
+	ended := false
+	defer func() { // a paused or failed run still gets its end recorded
+		if !ended {
+			st.endRun(rt.id, ev, time.Now())
 			_ = saveState(o, st)
-			say("[%s] PAUSED: %s", rc.Name, st.Reason)
-			return ferr
 		}
-		st.Verified = false
-		_ = saveState(o, st)
+	}()
 
-		if st.goalTotals().Pct() >= st.Goal {
-			say("[%s] estimate reached goal - verifying with a fresh full run...", rc.Name)
-			if err := fullMeasure(ctx, o, st, rc, "verify"); err != nil {
-				return err
-			}
-			fresh = true
-			if st.goalTotals().Pct() >= st.Goal {
-				break
-			}
-			say("[%s] verified %.2f%% < goal %.0f%% - estimate was optimistic, continuing", rc.Name, st.goalTotals().Pct(), st.Goal)
-		}
+	var fresh bool // st holds a full run made after the last item: close-out reuses it
+	if parallel {
+		fresh, err = runParallel(ctx, o, rc, st, b, acct, rt, ev)
+	} else {
+		fresh, err = runSequential(ctx, o, rc, st, b, acct, git, rt, ev)
+	}
+	if err != nil {
+		return err
 	}
 
 	if st.Status == "in-progress" && st.Reason == "" || st.Status == "planned" {
@@ -221,6 +281,8 @@ func runRepo(ctx context.Context, o *opts, rc RepoCfg, b *budget) error {
 		_ = fullMeasureQuiet(ctx, o, st, rc)
 	}
 	st.log("run:" + st.Status)
+	st.endRun(rt.id, ev, time.Now())
+	ended = true
 	if err := saveState(o, st); err != nil {
 		return err
 	}
@@ -230,6 +292,110 @@ func runRepo(ctx context.Context, o *opts, rc RepoCfg, b *budget) error {
 		pilotStats(rc.Name, st)
 	}
 	return nil
+}
+
+// runDryRun prints the claude command and prompt of the first queued item.
+// Nothing is saved.
+func runDryRun(ctx context.Context, o *opts, rc RepoCfg, st *RepoState, b *budget, acct *repoAcct) error {
+	for i := range st.Items {
+		it := &st.Items[i]
+		if it.Status != "queued" {
+			continue
+		}
+		left := b.nextCap(acct)
+		if left < minCallUSD {
+			say("[%s] DRY RUN: %s", rc.Name, budgetReason(o.cfg, left, st.SpendUSD, b.committed()))
+			return nil
+		}
+		prompt, err := dryRunPrompt(ctx, o, rc, st, it)
+		if err != nil {
+			return err
+		}
+		say("---- DRY RUN (%s, item %s) ----\ncommand: %s\n\n%s", rc.Name, it.ID, claudeArgsString(o, modelFor(o, it, 1), left), prompt)
+		return nil
+	}
+	say("[%s] DRY RUN: no queued item", rc.Name)
+	return nil
+}
+
+// startItem records that an item started (state and events.jsonl).
+func startItem(it *Item, run string, wave, worker int, wt, branch string, ev *eventLog, at time.Time) {
+	it.Run, it.StartedAt, it.FinishedAt = run, ts(at), ""
+	it.Wave, it.Worker, it.Worktree, it.Branch, it.MergeSHA = wave, worker, wt, branch, ""
+	ev.emitAt(at, "item-start", map[string]any{"item": it.ID, "worker": worker, "wave": wave, "worktree": wt, "branch": branch})
+}
+
+func endItemEvent(ev *eventLog, it *Item, status string) {
+	ev.emit("item-end", map[string]any{"item": it.ID, "worker": it.Worker, "status": status, "gained": it.Gained,
+		"cost_usd": it.CostUSD, "reason": it.Reason})
+}
+
+// runSequential works the queue one item at a time in the repo's own tree
+// (parallel = 1): each item is a wave of one, worker 1.
+func runSequential(ctx context.Context, o *opts, rc RepoCfg, st *RepoState, b *budget, acct *repoAcct, git bool, rt *runTrack, ev *eventLog) (bool, error) {
+	processed, wave := 0, 0
+	fresh := false
+	for i := range st.Items {
+		it := &st.Items[i]
+		if it.Status != "queued" {
+			continue
+		}
+		if o.pilot > 0 && processed >= o.pilot {
+			st.Status = "in-progress"
+			st.Reason = fmt.Sprintf("pilot of %d item(s) finished; re-run without -pilot to continue", o.pilot)
+			break
+		}
+		if b.timeUp() {
+			st.Status, st.Reason = "paused-budget", "time limit reached; re-run to resume"
+			break
+		}
+		if left := b.nextCap(acct); left < minCallUSD {
+			st.Status, st.Reason = "paused-budget", budgetReason(o.cfg, left, b.repoSpent(acct), b.committed())
+			break
+		}
+		st.Status = "in-progress"
+		st.Reason = ""
+		processed++
+		fresh = false
+		wave++
+		now := time.Now()
+		ev.emitAt(now, "wave-start", map[string]any{"wave": wave, "items": []string{it.ID}})
+		startItem(it, rt.id, wave, 1, "", currentBranch(rc.Path), ev, now)
+		_ = saveState(o, st)
+		head := headSHA(rc.Path)
+		rcI := rc
+		rcI.tag = rc.Name + " w1"
+		ferr := runItem(ctx, o, rcI, st, it, git, itemEnv{b: b, acct: acct, ev: ev, worker: 1})
+		it.FinishedAt = ts(time.Now())
+		if ferr != nil {
+			endItemEvent(ev, it, "paused")
+			st.Status, st.Reason = "paused-error", ferr.Error()
+			_ = saveState(o, st)
+			say("[%s] PAUSED: %s", rc.Name, st.Reason)
+			return fresh, ferr
+		}
+		if h := headSHA(rc.Path); it.Status == "done" && git && h != head {
+			it.MergeSHA = h
+			ev.emit("merge", map[string]any{"item": it.ID, "sha": h})
+		}
+		endItemEvent(ev, it, it.Status)
+		st.Verified = false
+		_ = saveState(o, st)
+
+		if st.goalTotals().Pct() >= st.Goal {
+			say("[%s] estimate reached goal - verifying with a fresh full run...", rc.Name)
+			if err := fullMeasure(ctx, o, st, rc, "verify"); err != nil {
+				return fresh, err
+			}
+			fresh = true
+			ev.emit("checkpoint", map[string]any{"wave": wave, "verified_pct": round2(st.goalTotals().Pct()), "goal": st.Goal})
+			if st.goalTotals().Pct() >= st.Goal {
+				break
+			}
+			say("[%s] verified %.2f%% < goal %.0f%% - estimate was optimistic, continuing", rc.Name, st.goalTotals().Pct(), st.Goal)
+		}
+	}
+	return fresh, nil
 }
 
 func fullMeasureQuiet(ctx context.Context, o *opts, st *RepoState, rc RepoCfg) error {
@@ -317,7 +483,23 @@ func measureItem(ctx context.Context, o *opts, rc RepoCfg, st *RepoState, it *It
 	return measure(ctx, rc.Path, mod, rel, flags, filepath.Join(repoDir(o, rc.Name), "logs", slug(it.ID)+"-"+tag+".log"))
 }
 
-func runItem(ctx context.Context, o *opts, rc RepoCfg, st *RepoState, it *Item, b *budget, git bool) error {
+// itemEnv is what runItem needs besides the item: the budget and the repo's
+// account, the event log and the worker slot it runs in.
+type itemEnv struct {
+	b      *budget
+	acct   *repoAcct
+	ev     *eventLog
+	worker int
+	pre    float64 // cap already reserved for attempt 1 when the item was dispatched; 0 = reserve here
+}
+
+func runItem(ctx context.Context, o *opts, rc RepoCfg, st *RepoState, it *Item, git bool, env itemEnv) error {
+	b, pre := env.b, env.pre
+	defer func() {
+		if pre > 0 { // dispatched, but no call was made
+			b.settleFor(env.acct, pre, 0)
+		}
+	}()
 	if git {
 		if err := requireCleanProduction(o, rc); err != nil {
 			return &fatalErr{err.Error()}
@@ -327,25 +509,46 @@ func runItem(ctx context.Context, o *opts, rc RepoCfg, st *RepoState, it *Item, 
 		return err
 	}
 	if err := preMeasure(ctx, o, rc, st, it); err != nil {
-		say("[%s] BLOCKED %s: %s", rc.Name, it.ID, it.Reason)
+		say("[%s] BLOCKED %s: %s", rc.label(), it.ID, it.Reason)
 		return nil
 	}
 	snap := snapshot(rc.Path, o.cfg.OutDir)
 	failNote := ""
+	backoffs := 0
 
 	for attempt := 1; attempt <= o.cfg.MaxAttempts; attempt++ {
-		left, ok := b.reserve(st.SpendUSD)
+		b.waitGate(ctx)
+		left, ok := pre, pre > 0
+		if pre > 0 {
+			pre = 0
+		} else {
+			left, ok = b.reserveFor(env.acct)
+		}
 		if !ok {
 			it.Reason = "stopped: budget exhausted mid-item"
 			break
 		}
 		it.Attempts = attempt
 		model := modelFor(o, it, attempt)
-		say("[%s] %s attempt %d/%d (model %s, cap $%.2f)", rc.Name, it.ID, attempt, o.cfg.MaxAttempts, model, left)
+		say("[%s] %s attempt %d/%d (model %s, cap $%.2f)", rc.label(), it.ID, attempt, o.cfg.MaxAttempts, model, left)
+		started := time.Now()
 		cost, cerr := callClaude(ctx, o, rc, st, it, model, left, failNote)
 		it.CostUSD += cost
 		st.SpendUSD += cost
-		b.settle(left, cost)
+		b.settleFor(env.acct, left, cost)
+		recordAttempt(it, env, attempt, model, left, cost, started, cerr)
+		var rl *rateLimitErr
+		if errors.As(cerr, &rl) {
+			if backoffs++; backoffs > maxBackoffs {
+				revertAll(rc.Path, snap, o.cfg.OutDir)
+				return &fatalErr{fmt.Sprintf("paused: rate or usage limit - claude -p was still rate limited after %d back-offs (%s); re-run later to resume", maxBackoffs, rl.msg)}
+			}
+			d := rateBackoff << (backoffs - 1)
+			say("[%s]   rate limited (%s): all workers back off %v, then attempt %d is retried", rc.label(), rl.msg, d, attempt)
+			b.backoff(d)
+			attempt-- // a rate-limited call did no work: it does not use up an attempt
+			continue
+		}
 		if fe, ok := cerr.(*fatalErr); ok {
 			it.Attempts--
 			revertAll(rc.Path, snap, o.cfg.OutDir)
@@ -356,7 +559,7 @@ func runItem(ctx context.Context, o *opts, rc RepoCfg, st *RepoState, it *Item, 
 		}
 
 		if ok, fn := verifyItem(ctx, o, rc, st, it, snap, git); ok {
-			say("[%s]   item $%.2f, repo $%.2f/%.0f, run $%.2f/%.0f", rc.Name, it.CostUSD, st.SpendUSD, o.cfg.Budget.MaxUSDPerRepo, b.runSpent(), o.cfg.Budget.MaxUSDTotal)
+			say("[%s]   item $%.2f, repo $%.2f/%.0f, run $%.2f/%.0f", rc.label(), it.CostUSD, b.repoSpent(env.acct), o.cfg.Budget.MaxUSDPerRepo, b.runSpent(), o.cfg.Budget.MaxUSDTotal)
 			return nil
 		} else {
 			failNote = fn
@@ -370,9 +573,20 @@ func runItem(ctx context.Context, o *opts, rc RepoCfg, st *RepoState, it *Item, 
 	if it.Reason == "" {
 		it.Reason = "no verified coverage gain after " + fmt.Sprint(o.cfg.MaxAttempts) + " attempts: " + firstLine(failNote)
 	}
-	say("[%s] BLOCKED %s: %s", rc.Name, it.ID, it.Reason)
+	say("[%s] BLOCKED %s: %s", rc.label(), it.ID, it.Reason)
 	st.log("blocked:" + it.ID)
 	return nil
+}
+
+// recordAttempt adds a claude call to the item's attempt log and events.jsonl.
+func recordAttempt(it *Item, env itemEnv, n int, model string, capUSD, cost float64, started time.Time, err error) {
+	a := Attempt{N: n, Run: env.ev.runID(), Worker: env.worker, Model: model, CapUSD: capUSD, CostUSD: cost, Started: ts(started), Ended: ts(time.Now())}
+	if err != nil {
+		a.Error = firstLine(err.Error())
+	}
+	it.AttemptLog = append(it.AttemptLog, a)
+	env.ev.emit("attempt", map[string]any{"item": it.ID, "worker": env.worker, "attempt": n, "model": model, "cap_usd": capUSD,
+		"cost_usd": cost, "started": a.Started, "error": a.Error})
 }
 
 // dryRunPrompt checks that the item's package builds and returns the task
@@ -412,7 +626,7 @@ func preMeasure(ctx context.Context, o *opts, rc RepoCfg, st *RepoState, it *Ite
 func verifyItem(ctx context.Context, o *opts, rc RepoCfg, st *RepoState, it *Item, snap map[string]string, git bool) (bool, string) {
 	if git {
 		if bad := revertForbidden(rc.Path, o.cfg.OutDir, o.cfg.AllowDeps); len(bad) > 0 {
-			say("[%s]   reverted forbidden edits: %s", rc.Name, strings.Join(bad, ", "))
+			say("[%s]   reverted forbidden edits: %s", rc.label(), strings.Join(bad, ", "))
 			st.Warnings = append(st.Warnings, fmt.Sprintf("%s: non-test files were edited %v; reverted by gocov", it.ID, bad))
 		}
 	}
@@ -468,13 +682,17 @@ func verifyItem(ctx context.Context, o *opts, rc RepoCfg, st *RepoState, it *Ite
 	if o.commit && git {
 		if err := gitCommit(rc.Path, it); err != nil {
 			w := fmt.Sprintf("%s: tests accepted but NOT committed: %v", it.ID, err)
-			say("[%s]   WARNING %s", rc.Name, w)
+			say("[%s]   WARNING %s", rc.label(), w)
 			st.Warnings = append(st.Warnings, w)
 		}
 	}
-	g := st.goalTotals()
-	say("[%s] DONE %s pkg %.1f%% -> %.1f%% (+%d stmts) | repo %.2f%% -> goal %.0f%% (%.2f to go, estimate)",
-		rc.Name, it.ID, it.PkgBefore, it.PkgAfter, gain, g.Pct(), st.Goal, st.Goal-g.Pct())
+	if st.partial { // a parallel worker sees only its own item: the repo figure comes at merge
+		say("[%s] DONE %s pkg %.1f%% -> %.1f%% (+%d stmts), waiting to merge", rc.label(), it.ID, it.PkgBefore, it.PkgAfter, gain)
+	} else {
+		g := st.goalTotals()
+		say("[%s] DONE %s pkg %.1f%% -> %.1f%% (+%d stmts) | repo %.2f%% -> goal %.0f%% (%.2f to go, estimate)",
+			rc.label(), it.ID, it.PkgBefore, it.PkgAfter, gain, g.Pct(), st.Goal, st.Goal-g.Pct())
+	}
 	st.log("done:" + it.ID)
 	return true, ""
 }
@@ -596,18 +814,20 @@ func newlyCovered(st *RepoState, files []string, after *Measurement) map[string]
 
 // applyGain moves newly covered blocks into the live row figures; a fresh full
 // run replaces them. The estimate can only be low (a new test may also cover
-// other packages), never high.
+// other packages), never high. Only blocks still uncovered count: a parallel
+// item's blocks may have been credited by a checkpoint since it started.
 func applyGain(st *RepoState, newly map[string][]UBlock) {
 	for f, hit := range newly {
 		done := map[string]bool{}
-		n := 0
 		for _, b := range hit {
 			done[b.Span] = true
-			n += b.Stmts
 		}
 		var left []UBlock
+		n := 0
 		for _, b := range st.UncovBlocks[f] {
-			if !done[b.Span] {
+			if done[b.Span] {
+				n += b.Stmts
+			} else {
 				left = append(left, b)
 			}
 		}
@@ -685,6 +905,14 @@ func killedAtTimeout(cctx context.Context) bool {
 	return errors.Is(cctx.Err(), context.DeadlineExceeded)
 }
 
+// rateLimitErr is a claude call refused by a rate limit: retried after a
+// back-off, without using up an attempt.
+type rateLimitErr struct{ msg string }
+
+func (e *rateLimitErr) Error() string { return "rate limited: " + e.msg }
+
+var rateLimitRe = regexp.MustCompile(`(?i)rate[ _-]?limit|\b429\b|overloaded|too many requests`)
+
 type claudeResult struct {
 	TerminalReason string  `json:"terminal_reason"`
 	Result         string  `json:"result"`
@@ -713,8 +941,15 @@ func callClaude(ctx context.Context, o *opts, rc RepoCfg, st *RepoState, it *Ite
 	cost := 0.0
 	if jerr := json.Unmarshal(stdout.Bytes(), &res); jerr == nil {
 		cost = res.TotalCostUSD
-		if res.IsError && (res.TerminalReason == "api_error" || cost == 0) {
-			return cost, &fatalErr{fmt.Sprintf("claude -p could not run: %s (no model call was made; fix this, then re-run to resume)", firstLine(res.Result))}
+		switch {
+		case res.IsError && rateLimitRe.MatchString(res.Result):
+			return cost, &rateLimitErr{firstLine(res.Result)}
+		case res.IsError && cost == 0:
+			// the auth probe at the start of the run passed: mid-run this is a
+			// rate or usage limit, not a login problem
+			return cost, &fatalErr{fmt.Sprintf("paused: rate or usage limit - claude -p returned an error without spending anything: %s; wait, then re-run to resume (the item stays queued)", firstLine(res.Result))}
+		case res.IsError && res.TerminalReason == "api_error":
+			return cost, &fatalErr{fmt.Sprintf("claude -p hit an API error: %s; re-run to resume", firstLine(res.Result))}
 		}
 		if res.IsError || strings.HasPrefix(res.Subtype, "error") {
 			return cost, fmt.Errorf("claude reported %s", res.Subtype)
@@ -891,6 +1126,9 @@ func snapshot(root, outDir string) map[string]string {
 		return res
 	}
 	outAbs, _ := filepath.Abs(outDir)
+	if rootAbs, _ := filepath.Abs(root); within(rootAbs, outAbs) {
+		outAbs = "" // the tree itself is in out_dir (a parallel item's worktree): nothing to skip
+	}
 	entries := strings.Split(out, "\x00")
 	for i := 0; i < len(entries); i++ {
 		e := entries[i]
@@ -902,7 +1140,7 @@ func snapshot(root, outDir string) map[string]string {
 			i++
 		}
 		abs := filepath.Join(root, filepath.FromSlash(p))
-		if outAbs != "" && strings.HasPrefix(abs, outAbs) {
+		if outAbs != "" && within(abs, outAbs) {
 			continue
 		}
 		h := "deleted"
@@ -913,6 +1151,15 @@ func snapshot(root, outDir string) map[string]string {
 		res[p] = h
 	}
 	return res
+}
+
+// within reports whether p is dir or inside it.
+func within(p, dir string) bool {
+	if dir == "" {
+		return false
+	}
+	p, dir = filepath.Clean(p), filepath.Clean(dir)
+	return strings.EqualFold(p, dir) || strings.HasPrefix(strings.ToLower(p), strings.ToLower(dir)+string(filepath.Separator))
 }
 
 func dirtyFiles(root, outDir string) []string {
@@ -1102,7 +1349,9 @@ func cmdBegin(ctx context.Context, o *opts, id string) error {
 	if err := ensureBlocks(ctx, o, st, rc); err != nil {
 		return err
 	}
+	ev := startSessionItem(o, st, it)
 	if err := preMeasure(ctx, o, rc, st, it); err != nil {
+		endSessionItem(st, it, ev)
 		if serr := saveState(o, st); serr != nil {
 			return serr
 		}
@@ -1158,7 +1407,7 @@ func beginDryRun(ctx context.Context, o *opts, rc RepoCfg, st *RepoState, it *It
 // cmdFinish: verify what was written (revert forbidden edits, tests green, flake
 // check, real gain). Success marks done; failure returns feedback, or with
 // -abandon reverts the attempt and marks the item blocked.
-func cmdFinish(ctx context.Context, o *opts, id string, abandon bool, cost float64) error {
+func cmdFinish(ctx context.Context, o *opts, id string, abandon bool, cost float64, model string, capUSD float64) error {
 	rc, st, err := oneRepo(o)
 	if err != nil {
 		return err
@@ -1174,6 +1423,7 @@ func cmdFinish(ctx context.Context, o *opts, id string, abandon bool, cost float
 	snap := map[string]string{}
 	_ = json.Unmarshal(data, &snap)
 	g := isGit(rc.Path)
+	ev := startSessionItem(o, st, it) // a no-op unless finish runs without its begin in this run
 	it.Attempts++
 	it.CostUSD += cost
 	st.SpendUSD += cost
@@ -1183,11 +1433,28 @@ func cmdFinish(ctx context.Context, o *opts, id string, abandon bool, cost float
 		}
 		it.Status, it.Reason = "blocked", "abandoned by author after "+fmt.Sprint(it.Attempts)+" attempt(s)"
 		st.log("blocked:" + it.ID)
+		endSessionItem(st, it, ev)
 		fmt.Println("BLOCKED", it.ID, "- attempt reverted")
 		return saveState(o, st)
 	}
+	now := ts(time.Now())
+	it.AttemptLog = append(it.AttemptLog, Attempt{N: it.Attempts, Run: it.Run, Worker: 1, Model: model, CapUSD: capUSD, CostUSD: cost, Ended: now})
+	ev.emit("attempt", map[string]any{"item": it.ID, "worker": 1, "attempt": it.Attempts, "model": model, "cap_usd": capUSD, "cost_usd": cost})
+	head := ""
+	if g {
+		head = headSHA(rc.Path)
+	}
 	ok, fb := verifyItem(ctx, o, rc, st, it, snap, g)
 	st.Verified = false
+	if ok {
+		if h := headSHA(rc.Path); g && h != head {
+			it.MergeSHA = h
+			ev.emit("merge", map[string]any{"item": it.ID, "sha": h})
+		}
+		endSessionItem(st, it, ev)
+	} else if r := st.runByID(it.Run); r != nil {
+		st.measureRun(r, time.Now())
+	}
 	if err := saveState(o, st); err != nil {
 		return err
 	}

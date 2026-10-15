@@ -121,8 +121,19 @@ func TestFanoutScriptsChargeKilledCalls(t *testing.T) {
 				t.Fatalf("%d model calls, want 2 (both attempts); output:\n%s", n, out)
 			}
 			st := state(t, o)
-			if it := item(t, st, calcItem); it.Status != "blocked" || !near(it.CostUSD, 1.0) || !near(st.SpendUSD, 1.0) {
+			it := item(t, st, calcItem)
+			if it.Status != "blocked" || !near(it.CostUSD, 1.0) || !near(st.SpendUSD, 1.0) {
 				t.Errorf("item %s cost $%.2f, repo spend $%.2f; want blocked, two killed calls charged their $0.50 cap each ($1.00)\n%s", it.Status, it.CostUSD, st.SpendUSD, out)
+			}
+			if len(st.Runs) == 0 {
+				t.Fatalf("the script left no run record\n%s", out)
+			}
+			run := st.Runs[len(st.Runs)-1]
+			if run.Driver != r.name || run.Ended == "" || run.Items != 1 || run.MaxConcurrencyObserved != 1 || it.Run != run.ID {
+				t.Errorf("run record %+v (item run %q); want driver %s, ended, holding the item, max concurrency 1", run, it.Run, r.name)
+			}
+			if a := it.AttemptLog; len(a) != 2 || a[0].Model != "sonnet" || a[1].Model != "opus" || !near(a[0].CapUSD, 0.5) || !near(a[0].CostUSD, 0.5) {
+				t.Errorf("attempt log %+v; want both calls with their model, $0.50 cap and charged cost", a)
 			}
 		})
 	}

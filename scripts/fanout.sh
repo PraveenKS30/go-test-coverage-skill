@@ -65,11 +65,15 @@ claude_call() {
 cost_of() { local c; c="$(grep -o '"total_cost_usd": *[0-9.eE+-]*' "$1" 2>/dev/null | head -1 | cut -d: -f2 | tr -d ' ')"; echo "${c:-0}"; }
 add() { awk -v a="$1" -v b="$2" 'BEGIN{printf "%.4f", a+b}'; }
 
-WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT
+WORK="$(mktemp -d)"; RUN_ID=""
+# close the run record (times, measured concurrency) however the script ends
+trap 'rm -rf "$WORK"; [ -n "$RUN_ID" ] && g run-end -run "$RUN_ID" >/dev/null' EXIT
 SPENT=0; DONE=0; BLOCKED=0; N=0; VERIFIED=0; CALL=""; NC=0
 
 if [ "$DRY" -eq 0 ]; then
   "$GOCOV" preflight -config "$CFG" || exit 1   # fail in seconds, not after planning, if claude -p cannot authenticate
+  RUN_ID="$(g run-start -driver fanout.sh)" || exit 1
+  export GOCOV_RUN_ID="$RUN_ID"   # begin/finish record their items under this run
 fi
 
 IDS="$(g queue)" || exit 1
@@ -115,10 +119,10 @@ for ID in $IDS; do
     fi
     SPENT="$(add "$SPENT" "$C")"
     if grep -q '"is_error": *true' "$WORK/out.json" && [ "$(awk -v c="$C" 'BEGIN{print (c==0)}')" = 1 ]; then
-      echo "claude -p could not run: $(grep -o '"result": *"[^"]*"' "$WORK/out.json" | head -1)"
-      echo "(no model call was made; check login / API key, then re-run - the item stays queued)"; exit 1
+      echo "claude -p returned an error without spending anything: $(grep -o '"result": *"[^"]*"' "$WORK/out.json" | head -1)"
+      echo "(preflight passed, so this is usually a rate or usage limit: wait, then re-run - the item stays queued)"; exit 1
     fi
-    g finish -item "$ID" -cost "$C"; RC=$?
+    g finish -item "$ID" -cost "$C" -model "$M" -cap "$USD"; RC=$?
     if [ "$RC" -eq 0 ]; then OK=1; DONE=$((DONE+1)); break; fi
     [ "$RC" -ne 3 ] && { echo "gocov finish failed ($RC)"; exit "$RC"; }
     ATT=$((ATT+1))

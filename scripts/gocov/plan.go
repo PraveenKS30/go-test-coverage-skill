@@ -203,7 +203,7 @@ func buildPlan(o *opts, st *RepoState) {
 		it.ID = slug(k.mod) + ":" + k.pkg
 		it.Status = "reserve"
 		if p, ok := prev[it.ID]; ok {
-			it.Attempts, it.CostUSD = p.Attempts, p.CostUSD
+			it.Attempts, it.CostUSD, it.AttemptLog = p.Attempts, p.CostUSD, p.AttemptLog
 		}
 		items = append(items, *it)
 	}
@@ -501,8 +501,32 @@ func cmdStatus(o *opts) error {
 		if st.Reason != "" {
 			fmt.Printf("%-18s   reason: %s\n", "", st.Reason)
 		}
+		statusRun(st)
 	}
 	return nil
+}
+
+// statusRun prints the latest run's measured concurrency and, while it runs,
+// the items in progress with their worker slot.
+func statusRun(st *RepoState) {
+	if len(st.Runs) == 0 {
+		return
+	}
+	r := st.Runs[len(st.Runs)-1]
+	state := "ended " + clock(r.Ended)
+	if r.Ended == "" {
+		st.measureRun(&r, time.Now())
+		state = "running (or killed - see events.jsonl)"
+	}
+	fmt.Printf("%-18s   run %s: %s, parallel %d, %s; %d item(s), max concurrency observed %d, speed-up %.2fx\n", "", r.ID, r.Driver, r.Parallel, state, r.Items, r.MaxConcurrencyObserved, r.Speedup)
+	if r.Ended != "" {
+		return
+	}
+	for _, it := range st.Items {
+		if it.Run == r.ID && it.StartedAt != "" && it.FinishedAt == "" {
+			fmt.Printf("%-18s   running w%d  %s  (wave %d, since %s)\n", "", it.Worker, it.ID, it.Wave, clock(it.StartedAt))
+		}
+	}
 }
 
 // ---------------------------------------------------------------- verify ----
@@ -541,6 +565,7 @@ func cmdVerify(ctx context.Context, o *opts) error {
 		if err := fullMeasure(ctx, o, st, rc, "verify"); err != nil {
 			return err
 		}
+		closeSessionRuns(o, st)
 		finalize(o, st)
 		if err := saveState(o, st); err != nil {
 			return err
@@ -630,6 +655,8 @@ func writeFinal(o *opts, st *RepoState) error {
 		}
 		fmt.Fprintf(&sb, "| `%s` | %s | %.1f%% -> %.1f%% | %d | %d | $%.2f | %s |\n", itemName(it), it.Status, it.PkgBefore, it.PkgAfter, it.Gained, it.Attempts, it.CostUSD, strings.TrimSpace(extra))
 	}
+	sb.WriteString("\n")
+	writeRunSection(&sb, st)
 	if len(st.Failing) > 0 {
 		sb.WriteString("\n## Failing packages (latest full run)\n\n")
 		base := map[string]bool{}
