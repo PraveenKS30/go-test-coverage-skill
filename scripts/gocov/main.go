@@ -46,7 +46,7 @@ type Config struct {
 		MaxUSDTotal    float64 `json:"max_usd_total"`
 		MaxUSDPerRepo  float64 `json:"max_usd_per_repo"`
 		MaxUSDPerItem  float64 `json:"max_usd_per_item"`
-		ItemTimeoutMin int     `json:"item_timeout_min"`
+		ItemTimeoutMin float64 `json:"item_timeout_min"` // fractions allowed (0.5 = 30s)
 		TimeLimitMin   int     `json:"time_limit_min"`
 	} `json:"budget"`
 	Models struct {
@@ -133,6 +133,11 @@ type opts struct {
 	commit bool
 	force  bool
 	quiet  bool
+}
+
+// itemTimeout is how long one claude call may run before it is killed.
+func (c *Config) itemTimeout() time.Duration {
+	return time.Duration(c.Budget.ItemTimeoutMin * float64(time.Minute))
 }
 
 func (o *opts) repos() []RepoCfg {

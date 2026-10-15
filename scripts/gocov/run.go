@@ -11,12 +11,14 @@ import (
 	"crypto/sha1"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"os"
 	"os/exec"
 	"path"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -31,9 +33,13 @@ func say(format string, a ...any) {
 	fmt.Printf(format+"\n", a...)
 }
 
+// budget is the run-wide spend and time limit, shared by the repos run in
+// parallel (jobs > 1). A call's cap is reserved before it starts and settled to
+// its real cost after, so two repos can never be granted the same dollars.
 type budget struct {
 	mu       sync.Mutex
-	spent    float64
+	spent    float64 // settled: what finished calls cost
+	reserved float64 // caps of calls still running
 	deadline time.Time
 	cfg      *Config
 }
@@ -43,7 +49,36 @@ func (b *budget) runSpent() float64 {
 	defer b.mu.Unlock()
 	return b.spent
 }
-func (b *budget) add(u float64) { b.mu.Lock(); b.spent += u; b.mu.Unlock() }
+
+// committed is the settled spend plus the caps of calls still running: the
+// part of max_usd_total a new call cannot be granted.
+func (b *budget) committed() float64 {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.spent + b.reserved
+}
+
+// reserve computes the next call's cap against the committed run spend and,
+// if it is at least minCallUSD, holds it until settle. It returns the cap and
+// whether it was reserved.
+func (b *budget) reserve(repoSpent float64) (float64, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	left := callCap(b.cfg, repoSpent, b.spent+b.reserved)
+	if left < minCallUSD {
+		return left, false
+	}
+	b.reserved += left
+	return left, true
+}
+
+// settle releases a reservation and charges what the call actually cost.
+func (b *budget) settle(reserved, cost float64) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.reserved -= reserved
+	b.spent += cost
+}
 func (b *budget) timeUp() bool {
 	return !b.deadline.IsZero() && time.Now().After(b.deadline)
 }
@@ -120,6 +155,7 @@ func runRepo(ctx context.Context, o *opts, rc RepoCfg, b *budget) error {
 	}
 
 	processed := 0
+	fresh := false // st holds a full run made after the last item: close-out reuses it
 	for i := range st.Items {
 		it := &st.Items[i]
 		if it.Status != "queued" {
@@ -134,9 +170,9 @@ func runRepo(ctx context.Context, o *opts, rc RepoCfg, b *budget) error {
 			st.Status, st.Reason = "paused-budget", "time limit reached; re-run to resume"
 			break
 		}
-		left := callCap(o.cfg, st.SpendUSD, b.runSpent())
+		left := callCap(o.cfg, st.SpendUSD, b.committed())
 		if left < minCallUSD {
-			st.Status, st.Reason = "paused-budget", budgetReason(o.cfg, left, st.SpendUSD, b.runSpent())
+			st.Status, st.Reason = "paused-budget", budgetReason(o.cfg, left, st.SpendUSD, b.committed())
 			break
 		}
 		if o.dryRun {
@@ -150,6 +186,7 @@ func runRepo(ctx context.Context, o *opts, rc RepoCfg, b *budget) error {
 		st.Status = "in-progress"
 		st.Reason = ""
 		processed++
+		fresh = false
 		if ferr := runItem(ctx, o, rc, st, it, b, git); ferr != nil {
 			st.Status, st.Reason = "paused-error", ferr.Error()
 			_ = saveState(o, st)
@@ -164,6 +201,7 @@ func runRepo(ctx context.Context, o *opts, rc RepoCfg, b *budget) error {
 			if err := fullMeasure(ctx, o, st, rc, "verify"); err != nil {
 				return err
 			}
+			fresh = true
 			if st.goalTotals().Pct() >= st.Goal {
 				break
 			}
@@ -173,11 +211,13 @@ func runRepo(ctx context.Context, o *opts, rc RepoCfg, b *budget) error {
 
 	if st.Status == "in-progress" && st.Reason == "" || st.Status == "planned" {
 		// queue exhausted or goal estimate hit: close out with a verified figure
-		if err := fullMeasure(ctx, o, st, rc, "verify"); err != nil {
-			return err
+		if !fresh {
+			if err := fullMeasure(ctx, o, st, rc, "verify"); err != nil {
+				return err
+			}
 		}
 		finalize(o, st)
-	} else if st.Status == "paused-budget" || strings.HasPrefix(st.Reason, "pilot") {
+	} else if !fresh && (st.Status == "paused-budget" || strings.HasPrefix(st.Reason, "pilot")) {
 		_ = fullMeasureQuiet(ctx, o, st, rc)
 	}
 	st.log("run:" + st.Status)
@@ -294,8 +334,8 @@ func runItem(ctx context.Context, o *opts, rc RepoCfg, st *RepoState, it *Item, 
 	failNote := ""
 
 	for attempt := 1; attempt <= o.cfg.MaxAttempts; attempt++ {
-		left := callCap(o.cfg, st.SpendUSD, b.runSpent())
-		if left < minCallUSD {
+		left, ok := b.reserve(st.SpendUSD)
+		if !ok {
 			it.Reason = "stopped: budget exhausted mid-item"
 			break
 		}
@@ -305,7 +345,7 @@ func runItem(ctx context.Context, o *opts, rc RepoCfg, st *RepoState, it *Item, 
 		cost, cerr := callClaude(ctx, o, rc, st, it, model, left, failNote)
 		it.CostUSD += cost
 		st.SpendUSD += cost
-		b.add(cost)
+		b.settle(left, cost)
 		if fe, ok := cerr.(*fatalErr); ok {
 			it.Attempts--
 			revertAll(rc.Path, snap, o.cfg.OutDir)
@@ -316,7 +356,7 @@ func runItem(ctx context.Context, o *opts, rc RepoCfg, st *RepoState, it *Item, 
 		}
 
 		if ok, fn := verifyItem(ctx, o, rc, st, it, snap, git); ok {
-			say("[%s]   item $%.2f, repo $%.2f/%.0f, run $%.2f/%.0f", rc.Name, it.CostUSD, st.SpendUSD, o.cfg.Budget.MaxUSDPerRepo, b.spent, o.cfg.Budget.MaxUSDTotal)
+			say("[%s]   item $%.2f, repo $%.2f/%.0f, run $%.2f/%.0f", rc.Name, it.CostUSD, st.SpendUSD, o.cfg.Budget.MaxUSDPerRepo, b.runSpent(), o.cfg.Budget.MaxUSDTotal)
 			return nil
 		} else {
 			failNote = fn
@@ -380,15 +420,22 @@ func verifyItem(ctx context.Context, o *opts, rc RepoCfg, st *RepoState, it *Ite
 	if merr != nil || after.TestExit != 0 {
 		return false, "go test failed after your changes. Fix the tests (do not weaken them). Tail of log:\n" + tailFile(logOf(after, merr), 40)
 	}
-	mod := findModule(st, it.Module)
-	rel := "./" + pkgRelToModule(it.Module, it.Pkg)
-	fargs := append([]string{"-count=3"}, rc.TestFlags...)
+	modAbs := filepath.Join(rc.Path, filepath.FromSlash(it.Module))
+	rel := pkgArg(it)
+	fargs := append([]string{"-count=3", "-shuffle=on"}, rc.TestFlags...)
 	flog := filepath.Join(repoDir(o, rc.Name), "logs", slug(it.ID)+"-flake.log")
-	if code := goTest(ctx, filepath.Join(rc.Path, filepath.FromSlash(mod.Dir)), append(fargs, rel), flog); code != 0 {
-		return false, "tests are FLAKY or fail on repeat (-count=3). Remove time/ordering/shared-state dependence. Tail:\n" + tailFile(flog, 30)
+	if code := goTest(ctx, modAbs, append(fargs, rel), flog); code != 0 {
+		return false, "tests are FLAKY, order-dependent or fail on repeat (-count=3 -shuffle=on). Remove time/ordering/shared-state dependence: each test must pass alone and in any order. Tail:\n" + tailFile(flog, 30)
+	}
+	var newTests []string
+	if git {
+		newTests = changedTestFiles(rc.Path, snap, o.cfg.OutDir)
+		vlog := filepath.Join(repoDir(o, rc.Name), "logs", slug(it.ID)+"-vet.log")
+		if bad := vetFindings(ctx, rc, modAbs, rel, newTests, vlog); len(bad) > 0 {
+			return false, "go vet flags your new test files. Fix every finding (do not suppress vet):\n" + strings.Join(bad, "\n")
+		}
 	}
 	if lim := o.cfg.MaxComplexity; lim > 0 && git {
-		newTests := changedTestFiles(rc.Path, snap, o.cfg.OutDir)
 		pre := map[string]bool{}
 		for _, k := range it.PreOver {
 			pre[k] = true
@@ -419,7 +466,11 @@ func verifyItem(ctx context.Context, o *opts, rc RepoCfg, st *RepoState, it *Ite
 	applyGain(st, newly)
 	it.PkgAfter = pctOf(st.Rows, it.Files)
 	if o.commit && git {
-		gitCommit(rc.Path, it)
+		if err := gitCommit(rc.Path, it); err != nil {
+			w := fmt.Sprintf("%s: tests accepted but NOT committed: %v", it.ID, err)
+			say("[%s]   WARNING %s", rc.Name, w)
+			st.Warnings = append(st.Warnings, w)
+		}
 	}
 	g := st.goalTotals()
 	say("[%s] DONE %s pkg %.1f%% -> %.1f%% (+%d stmts) | repo %.2f%% -> goal %.0f%% (%.2f to go, estimate)",
@@ -427,6 +478,61 @@ func verifyItem(ctx context.Context, o *opts, rc RepoCfg, st *RepoState, it *Ite
 	st.log("done:" + it.ID)
 	return true, ""
 }
+
+// pkgArg is the item's package as a go command argument in its module dir.
+func pkgArg(it *Item) string {
+	rel := pkgRelToModule(it.Module, it.Pkg)
+	if rel == "" || rel == "." {
+		return "."
+	}
+	return "./" + rel
+}
+
+// vetFindings runs go vet on the item's package and returns the findings in
+// files (repo-relative): the ones the author wrote. Findings in production
+// code or older tests are not the author's to fix and are ignored.
+func vetFindings(ctx context.Context, rc RepoCfg, modAbs, pkg string, files []string, logPath string) []string {
+	if len(files) == 0 {
+		return nil
+	}
+	mine := map[string]bool{}
+	for _, f := range files {
+		mine[filepath.Clean(filepath.Join(rc.Path, filepath.FromSlash(f)))] = true
+	}
+	args := []string{"vet"}
+	for _, f := range rc.TestFlags {
+		if strings.HasPrefix(f, "-tags") { // the only test flag that changes what vet builds
+			args = append(args, f)
+		}
+	}
+	cmd := exec.CommandContext(ctx, "go", append(args, pkg)...)
+	cmd.Dir = modAbs
+	out, err := cmd.CombinedOutput()
+	_ = os.MkdirAll(filepath.Dir(logPath), 0o755)
+	_ = os.WriteFile(logPath, out, 0o644)
+	if err == nil {
+		return nil
+	}
+	var bad []string
+	for _, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimSpace(line)
+		m := vetPosRe.FindStringSubmatch(line)
+		if m == nil {
+			continue
+		}
+		f := m[1]
+		if !filepath.IsAbs(f) {
+			f = filepath.Join(modAbs, f)
+		}
+		if mine[filepath.Clean(f)] {
+			bad = append(bad, line)
+		}
+	}
+	return bad
+}
+
+// vetPosRe matches the file of a "file.go:line:col: message" vet finding.
+var vetPosRe = regexp.MustCompile(`^(.+?\.go):\d+(?::\d+)?: `)
 
 func firstLine(s string) string {
 	if i := strings.IndexByte(s, '\n'); i >= 0 {
@@ -568,6 +674,17 @@ type fatalErr struct{ msg string }
 
 func (e *fatalErr) Error() string { return e.msg }
 
+// waitDelay bounds the wait for a killed claude's output pipes: a tool process
+// it started can outlive it and hold them open, which would hang the run.
+const waitDelay = 10 * time.Second
+
+// killedAtTimeout reports whether a call's context expired (item_timeout_min).
+// A killed call reports no cost, so callers charge its whole cap: the most it
+// may have spent, and never less than it spent.
+func killedAtTimeout(cctx context.Context) bool {
+	return errors.Is(cctx.Err(), context.DeadlineExceeded)
+}
+
 type claudeResult struct {
 	TerminalReason string  `json:"terminal_reason"`
 	Result         string  `json:"result"`
@@ -578,15 +695,20 @@ type claudeResult struct {
 }
 
 func callClaude(ctx context.Context, o *opts, rc RepoCfg, st *RepoState, it *Item, model string, usd float64, failNote string) (float64, error) {
-	cctx, cancel := context.WithTimeout(ctx, time.Duration(o.cfg.Budget.ItemTimeoutMin)*time.Minute)
+	cctx, cancel := context.WithTimeout(ctx, o.cfg.itemTimeout())
 	defer cancel()
 	cmd := exec.CommandContext(cctx, "claude", claudeArgs(o, model, usd)...)
 	cmd.Dir = filepath.Join(rc.Path, filepath.FromSlash(it.Module))
 	cmd.Stdin = strings.NewReader(buildPrompt(o, rc, st, it, failNote))
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &stdout, &stderr
+	cmd.WaitDelay = waitDelay
 	err := cmd.Run()
 	_ = os.WriteFile(filepath.Join(repoDir(o, rc.Name), "logs", slug(it.ID)+"-claude.json"), stdout.Bytes(), 0o644)
+	if killedAtTimeout(cctx) {
+		say("[%s]   claude killed at the %v item_timeout_min: charging its cap $%.2f (a killed call reports no cost)", rc.Name, o.cfg.itemTimeout(), usd)
+		return usd, fmt.Errorf("claude was killed at the %v time limit before finishing; work in smaller steps and run the tests sooner", o.cfg.itemTimeout())
+	}
 	var res claudeResult
 	cost := 0.0
 	if jerr := json.Unmarshal(stdout.Bytes(), &res); jerr == nil {
@@ -618,8 +740,8 @@ func buildPrompt(o *opts, rc RepoCfg, st *RepoState, it *Item, failNote string) 
 	var sb strings.Builder
 	mod := findModule(st, it.Module)
 	fmt.Fprintf(&sb, "Raise the unit-test coverage of ONE Go package with real, behavior-verifying tests.\n\n")
-	fmt.Fprintf(&sb, "Package dir (repo-relative): %s\nModule: %s (go %s, testify in go.mod: %v)\nCurrent package coverage: %.1f%% (%d uncovered statements). Repo goal: %.0f%%.\n",
-		it.Pkg, mod.Path, mod.GoVersion, mod.Testify, it.PkgBefore, it.Uncovered, st.Goal)
+	fmt.Fprintf(&sb, "Working directory: %s (the module root; run go commands from here)\nPackage dir: %s (relative to the module root; %s from the repo root)\nModule: %s (go %s, testify in go.mod: %v)\nCurrent package coverage: %.1f%% (%d uncovered statements). Repo goal: %.0f%%.\n",
+		filepath.Join(rc.Path, filepath.FromSlash(it.Module)), pkgArg(it), it.Pkg, mod.Path, mod.GoVersion, mod.Testify, it.PkgBefore, it.Uncovered, st.Goal)
 	if len(rc.TestFlags) > 0 {
 		fmt.Fprintf(&sb, "Always run tests with these extra flags: %s\n", strings.Join(rc.TestFlags, " "))
 	}
@@ -734,12 +856,30 @@ func gitCheckoutBranch(root, branch string) error {
 	return nil
 }
 
-func gitCommit(root string, it *Item) {
-	if len(it.TestFiles) == 0 {
-		return
+// gitCommit commits the item's test files and nothing else: other changes in
+// the tree (the user's, out_dir inside the repo) stay uncommitted.
+func gitCommit(root string, it *Item) error {
+	var files []string
+	for _, p := range it.TestFiles {
+		_, err := os.Stat(filepath.Join(root, filepath.FromSlash(p)))
+		if _, terr := git(root, "cat-file", "-e", "HEAD:"+p); err == nil || terr == nil {
+			files = append(files, p) // on disk, or a tracked file the item deleted
+		}
 	}
-	_, _ = git(root, append([]string{"add", "--"}, it.TestFiles...)...)
-	_, _ = git(root, "commit", "-m", fmt.Sprintf("test(%s): add behavioral tests (+%d covered statements)", it.Pkg, it.Gained), "--", ".")
+	if len(files) == 0 {
+		return nil
+	}
+	if out, err := git(root, append([]string{"add", "-A", "--"}, files...)...); err != nil {
+		return fmt.Errorf("git add: %v: %s", err, strings.TrimSpace(out))
+	}
+	if _, err := git(root, append([]string{"diff", "--cached", "--quiet", "HEAD", "--"}, files...)...); err == nil {
+		return nil // nothing of this item's left to commit
+	}
+	msg := fmt.Sprintf("test(%s): add behavioral tests (+%d covered statements)", it.Pkg, it.Gained)
+	if out, err := git(root, append([]string{"commit", "-q", "-m", msg, "--only", "--"}, files...)...); err != nil {
+		return fmt.Errorf("git commit: %v: %s", err, strings.TrimSpace(out))
+	}
+	return nil
 }
 
 // changed returns repo-relative path -> content hash for every modified or
@@ -1119,7 +1259,7 @@ func cmdNextCall(o *opts, id string, attempt int, runSpent float64, elapsed int)
 	} else if left := callCap(o.cfg, st.SpendUSD, runSpent); left < minCallUSD {
 		pause = budgetReason(o.cfg, left, st.SpendUSD, runSpent)
 	} else {
-		fmt.Printf("%s %.2f %d %s\n", modelFor(o, it, attempt), left, o.cfg.Budget.ItemTimeoutMin*60, filepath.Join(rc.Path, filepath.FromSlash(it.Module)))
+		fmt.Printf("%s %.2f %d %s\n", modelFor(o, it, attempt), left, int(math.Ceil(o.cfg.itemTimeout().Seconds())), filepath.Join(rc.Path, filepath.FromSlash(it.Module)))
 		return nil
 	}
 	fmt.Println(pause)

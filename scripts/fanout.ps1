@@ -60,13 +60,14 @@ function Get-ClaudeLine($c, [string]$inFile, [string]$outFile) {
 }
 
 # One capped call in the module dir, killed with its child processes after
-# $c.Secs seconds so a hung call cannot block the run.
+# $c.Secs seconds so a hung call cannot block the run. Returns $true if killed
+# (a killed call reports no cost; the caller charges its cap).
 function Invoke-Claude($c, [string]$inFile, [string]$outFile) {
     $p = Start-Process -FilePath $env:ComSpec -ArgumentList "/d /s /c `"$(Get-ClaudeLine $c $inFile $outFile)`"" -WorkingDirectory $c.Dir -NoNewWindow -PassThru
-    if (-not $p.WaitForExit($c.Secs * 1000)) {
-        & taskkill /T /F /PID $p.Id | Out-Null
-        Write-Host "[$Repo]   claude killed at the $($c.Secs)s timeout"
-    }
+    if ($p.WaitForExit($c.Secs * 1000)) { return $false }
+    & taskkill /T /F /PID $p.Id | Out-Null
+    Write-Host "[$Repo]   claude killed at the $($c.Secs)s timeout: charging its cap `$$($c.Usd) (a killed call reports no cost)"
+    return $true
 }
 
 if (-not $DryRun) {
@@ -119,9 +120,9 @@ try {
             }
             Remove-Item $out -ErrorAction SilentlyContinue
             Write-Host ("[{0}] {1} attempt {2} (model {3}, cap `${4}, timeout {5}s)" -f $Repo, $id, $att, $call.Model, $call.Usd, $call.Secs)
-            Invoke-Claude $call $in $out
+            $killed = Invoke-Claude $call $in $out
             $res = $null; try { $res = Get-Content -Raw $out | ConvertFrom-Json } catch {}
-            $cost = if ($res -and $res.total_cost_usd) { [double]$res.total_cost_usd } else { 0.0 }
+            $cost = if ($killed) { [double]::Parse($call.Usd, $inv) } elseif ($res -and $res.total_cost_usd) { [double]$res.total_cost_usd } else { 0.0 }
             $spent += $cost
             if ($res -and $res.is_error -and $cost -eq 0) {
                 Write-Host "claude -p could not run: $($res.result)"

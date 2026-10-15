@@ -39,7 +39,7 @@ A verify below the goal with items still `queued` (after `-pilot`, a budget paus
 ## Config keys
 
 Top level: `out_dir`, `jobs` (repos in parallel), `min_uncovered_stmts` (skip smaller packages, default 15), `max_attempts` (default 2), `goal_margin_pct` (plan to goal+margin, default 3), `est_usd_per_item`, `est_min_per_item` (estimate inputs; calibrate with `-pilot`), `race` (run `-race` on touched packages; needs cgo), `allow_deps` (let an author touch go.mod/go.sum - off by default), `max_complexity` (default 15, `-1` off), `complexity_metric` (`cyclomatic`|`cognitive`|`both`).
-`budget`: `max_usd_total`, `max_usd_per_repo`, `max_usd_per_item`, `item_timeout_min`, `time_limit_min`. `models`: `default`, `escalate`.
+`budget`: `max_usd_total`, `max_usd_per_repo`, `max_usd_per_item`, `item_timeout_min` (fractions allowed, e.g. `0.5` = 30 s), `time_limit_min`. `models`: `default`, `escalate`.
 Per repo: `name`, `path`, `goal`, `goal_basis` (`adjusted` default | `raw`), `paths` (scope folders/files/globs), `test_flags` (e.g. `["-tags=unit"]`), `exclude` (globs of MACHINE-GENERATED files only), `branch` (work branch), `allow_non_git`.
 
 Working example: `batch-config-example.json`.

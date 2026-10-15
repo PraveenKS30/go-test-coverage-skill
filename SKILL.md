@@ -2,7 +2,7 @@
 name: go-test-coverage
 description: Measures, plans and raises Go unit-test coverage to a goal (e.g. 60% or 80%) across one or many repos, folders or files, while keeping every function it writes under a complexity limit (default 15). Always produces a coverage report first, ranks packages by uncovered statements, gets the plan approved, then writes real behavior-verifying table-driven tests (never padding stubs), reports progress after every package, and marks each repo achieved only after a fresh full run verifies the goal. Works inside Claude Desktop/CLI with no extra login, or headless with `claude -p` and cost caps for large batches. Use when the user says "improve/increase test coverage", "get coverage to 60/80%", "write unit tests for this Go package/repo(s)", "coverage report for Go repos", or "keep complexity under 15" for Go code.
 metadata:
-  version: 2.6.0
+  version: 2.7.0
 ---
 
 # Go Test Coverage
@@ -53,7 +53,7 @@ Follow the mode's reference file. Whatever the mode, every test must pass these:
 - **Only `_test.go` / `testdata/` files change.** Production code, `go.mod` and `go.sum` are untouched unless the user approved a specific refactor.
 - If you notice a production bug, verify it with a throwaway test, report it, and do not encode the buggy behavior in a test.
 
-`gocov finish` (in-session) and `gocov run` (headless) enforce: non-test edits reverted, green tests, no new over-limit function, `-count=3` flake check, real new coverage.
+`gocov finish` (in-session) and `gocov run` (headless) enforce: non-test edits reverted, green tests, `-count=3 -shuffle=on` flake check, `go vet` clean new tests, no new over-limit function, real new coverage.
 
 ## Step 4 - Report progress
 

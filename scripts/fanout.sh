@@ -49,13 +49,15 @@ TOOLS='Read,Edit,Write,Glob,Grep,Bash(go test *),Bash(go vet *),Bash(go build *)
 next_call() { CALL="$(g next-call -item "$1" -attempt "$2" -spent "$SPENT" -elapsed "$SECONDS" $DRYF)"; NC=$?; [ "$NC" -eq 0 ]; }
 
 # claude_call MODEL USD SECS WORKDIR IN OUT: one capped call in the module dir,
-# killed after SECS seconds so a hung call cannot block the run.
+# killed after SECS seconds so a hung call cannot block the run. A kill leaves
+# OUT.killed behind (a killed call reports no cost; the caller charges its cap).
 claude_call() {
+  rm -f "$6.killed"
   ( cd "$4" && exec claude -p --output-format json --model "$1" --permission-mode dontAsk \
       --max-budget-usd "$2" --no-session-persistence --allowedTools "$TOOLS" < "$5" > "$6" ) &
   local pid=$!
   # the watchdog kills its own sleep when it is stopped, so none is left behind
-  ( trap 'kill "$s" 2>/dev/null; exit 0' TERM; sleep "$3" & s=$!; wait "$s"; kill "$pid" 2>/dev/null ) & local dog=$!
+  ( trap 'kill "$s" 2>/dev/null; exit 0' TERM; sleep "$3" & s=$!; wait "$s"; : > "$6.killed"; kill "$pid" 2>/dev/null ) & local dog=$!
   wait "$pid"; local rc=$?
   kill "$dog" 2>/dev/null
   return "$rc"
@@ -106,8 +108,12 @@ for ID in $IDS; do
     [ -s "$FEEDBACK_FILE" ] && { printf '\n\nPREVIOUS ATTEMPT FEEDBACK - fix this first:\n' >> "$WORK/in.md"; cat "$FEEDBACK_FILE" >> "$WORK/in.md"; }
     echo "[$REPO] $ID attempt $ATT (model $M, cap \$$USD, timeout ${SECS}s)"
     claude_call "$M" "$USD" "$SECS" "$WD" "$WORK/in.md" "$WORK/out.json"
-    [ $? -ge 128 ] && echo "[$REPO]   claude killed at the ${SECS}s timeout"
-    C="$(cost_of "$WORK/out.json")"; SPENT="$(add "$SPENT" "$C")"
+    if [ -e "$WORK/out.json.killed" ]; then
+      C="$USD"; echo "[$REPO]   claude killed at the ${SECS}s timeout: charging its cap \$$USD (a killed call reports no cost)"
+    else
+      C="$(cost_of "$WORK/out.json")"
+    fi
+    SPENT="$(add "$SPENT" "$C")"
     if grep -q '"is_error": *true' "$WORK/out.json" && [ "$(awk -v c="$C" 'BEGIN{print (c==0)}')" = 1 ]; then
       echo "claude -p could not run: $(grep -o '"result": *"[^"]*"' "$WORK/out.json" | head -1)"
       echo "(no model call was made; check login / API key, then re-run - the item stays queued)"; exit 1
