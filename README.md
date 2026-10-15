@@ -36,7 +36,7 @@ scripts/fanout.sh  -c cfg.json -r REPO -n 3     # pilot: first 3 packages, print
 scripts\fanout.ps1 -Config cfg.json -Repo REPO -Pilot 3
 ```
 
-The repo path, models, spend caps, attempts and timeouts all come from the config (`references/batch-config-example.json`), the same rules `gocov run` applies.
+The repo path, models, spend caps, attempts and timeouts all come from the config (`references/batch-config-example.json`), the same rules `gocov run` applies. `gocov run -parallel N` also works several packages of one repo at once, each in its own git worktree, and records how parallel the run really was (`events.jsonl`, `state.json` `runs[]`, the "Run" section of `FINAL_REPORT.md`).
 
 Run `gocov report` and `gocov plan` first (see `SKILL.md`). Config template: `references/batch-config-example.json`.
 

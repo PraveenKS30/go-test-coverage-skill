@@ -1,6 +1,7 @@
 {
   "out_dir": "gocov-out",
   "jobs": 2,
+  "parallel": 1,
   "budget": {
     "max_usd_total": 20,
     "max_usd_per_repo": 10,

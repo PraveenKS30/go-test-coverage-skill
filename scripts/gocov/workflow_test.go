@@ -114,6 +114,13 @@ const calcItem = "root:calc"
 
 func newFixture(t *testing.T, goal float64) (*opts, string) {
 	t.Helper()
+	return newFixtureFrom(t, fixture, goal)
+}
+
+// newFixtureFrom commits files to a new git repo "demo" and returns options
+// for it with the given goal.
+func newFixtureFrom(t *testing.T, files map[string]string, goal float64) (*opts, string) {
+	t.Helper()
 	if testing.Short() {
 		t.Skip("runs go test on a generated repo; skipped with -short")
 	}
@@ -123,7 +130,7 @@ func newFixture(t *testing.T, goal float64) (*opts, string) {
 		}
 	}
 	dir := t.TempDir()
-	for name, body := range fixture {
+	for name, body := range files {
 		writeFile(t, dir, name, body)
 	}
 	mustGit(t, dir, "init", "-q")
@@ -177,7 +184,7 @@ func item(t *testing.T, st *RepoState, id string) Item {
 func finish(t *testing.T, o *opts, id string) int {
 	t.Helper()
 	exitCode = 0
-	mustRun(t, "finish", cmdFinish(context.Background(), o, id, false, 0))
+	mustRun(t, "finish", cmdFinish(context.Background(), o, id, false, 0, "", 0))
 	code := exitCode
 	exitCode = 0
 	return code

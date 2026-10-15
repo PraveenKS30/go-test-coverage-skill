@@ -70,9 +70,13 @@ function Invoke-Claude($c, [string]$inFile, [string]$outFile) {
     return $true
 }
 
+$runId = $null
 if (-not $DryRun) {
     & $gocov preflight -config $Config      # fail in seconds if claude -p cannot authenticate
     if ($LASTEXITCODE -ne 0) { exit 1 }
+    $runId = G "run-start" @("-driver", "fanout.ps1")
+    if ($LASTEXITCODE -ne 0) { exit 1 }
+    $env:GOCOV_RUN_ID = $runId   # begin/finish record their items under this run
 }
 
 $work = New-Item -ItemType Directory -Path (Join-Path ([IO.Path]::GetTempPath()) ("fanout-" + [guid]::NewGuid()))
@@ -125,10 +129,10 @@ try {
             $cost = if ($killed) { [double]::Parse($call.Usd, $inv) } elseif ($res -and $res.total_cost_usd) { [double]$res.total_cost_usd } else { 0.0 }
             $spent += $cost
             if ($res -and $res.is_error -and $cost -eq 0) {
-                Write-Host "claude -p could not run: $($res.result)"
-                Write-Host "(no model call was made; check login / API key, then re-run - the item stays queued)"; exit 1
+                Write-Host "claude -p returned an error without spending anything: $($res.result)"
+                Write-Host "(preflight passed, so this is usually a rate or usage limit: wait, then re-run - the item stays queued)"; exit 1
             }
-            G "finish" @("-item", $id, "-cost", $cost.ToString($inv))
+            G "finish" @("-item", $id, "-cost", $cost.ToString($inv), "-model", $call.Model, "-cap", $call.Usd)
             $rc = $LASTEXITCODE
             if ($rc -eq 0) { $ok = $true; $done++; break }
             if ($rc -ne 3) { Write-Host "gocov finish failed ($rc)"; exit $rc }
@@ -147,4 +151,8 @@ try {
     if ($Review) { G "review" @("-headless") } else { Write-Host "Next: gocov review (adversarial review of the new tests)" }
 } finally {
     Remove-Item -Recurse -Force $work -ErrorAction SilentlyContinue
+    if ($runId) {   # close the run record (times, measured concurrency) however the script ends
+        G "run-end" @("-run", $runId) | Out-Null
+        Remove-Item Env:GOCOV_RUN_ID -ErrorAction SilentlyContinue
+    }
 }

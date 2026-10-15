@@ -2,7 +2,7 @@
 name: go-test-coverage
 description: Measures, plans and raises Go unit-test coverage to a goal (e.g. 60% or 80%) across one or many repos, folders or files, while keeping every function it writes under a complexity limit (default 15). Always produces a coverage report first, ranks packages by uncovered statements, gets the plan approved, then writes real behavior-verifying table-driven tests (never padding stubs), reports progress after every package, and marks each repo achieved only after a fresh full run verifies the goal. Works inside Claude Desktop/CLI with no extra login, or headless with `claude -p` and cost caps for large batches. Use when the user says "improve/increase test coverage", "get coverage to 60/80%", "write unit tests for this Go package/repo(s)", "coverage report for Go repos", or "keep complexity under 15" for Go code.
 metadata:
-  version: 2.7.0
+  version: 2.8.0
 ---
 
 # Go Test Coverage
@@ -28,7 +28,7 @@ Commands, config keys, outputs and statuses: `references/gocov-reference.md`. Co
 3. **Complexity limit**: "Is there a per-function limit (commonly 15), and does it include test files?" Default 15, enforced on every test function this skill writes. Detail: `references/complexity.md`.
 4. **Mode - by where you are running, never by asking the user to log in:**
    - Inside Claude Desktop or the Claude CLI (normal case): **in-session mode** - `references/in-session-mode.md`.
-   - Unattended / CI / very large batches: **headless** - a plain script loops over `claude -p`, one fresh call per package, as in Claude Code's "fan out across files" guidance: `scripts/fanout.sh` or `scripts/fanout.ps1` (or the built-in `gocov run`). The *script* runs the commands, not a model. See `references/headless-mode.md`. It needs the standalone CLI logged in or `ANTHROPIC_API_KEY`; a child `claude -p` cannot reuse the Desktop/session login. If its preflight fails while you are in a session, switch to in-session mode.
+   - Unattended / CI / very large batches: **headless** - a plain script loops over `claude -p`, one fresh call per package, as in Claude Code's "fan out across files" guidance: `scripts/fanout.sh` or `scripts/fanout.ps1` (or the built-in `gocov run`, which can also work several packages at once with `-parallel N`, each in its own git worktree, merged one at a time). The *script* runs the commands, not a model. See `references/headless-mode.md`. It needs the standalone CLI logged in or `ANTHROPIC_API_KEY`; a child `claude -p` cannot reuse the Desktop/session login. If its preflight fails while you are in a session, switch to in-session mode.
 5. **Budget** (headless): total / per-repo / per-item USD caps.
 6. Write the config (or use `-path`). Every repo should be a git repo (work happens on a branch, edits are revertable); if not, offer `git init` + initial commit and get an explicit OK.
 
@@ -57,7 +57,7 @@ Follow the mode's reference file. Whatever the mode, every test must pass these:
 
 ## Step 4 - Report progress
 
-After every package: package before -> after, repo % vs goal, points left, items done/queued/blocked, spend. `gocov status` for the cross-repo table. Combined figures are statement-weighted, **never an average of percentages**. In-flight numbers are estimates until a fresh full run.
+After every package: package before -> after, repo % vs goal, points left, items done/queued/blocked, spend. `gocov status` for the cross-repo table (and, during a run, the items in progress with their worker slot). Whether a run really ran in parallel is measured, not assumed: `state.json` `runs[]`, `events.jsonl` and the "Run" section of `FINAL_REPORT.md` give `max_concurrency_observed` and the speed-up. Combined figures are statement-weighted, **never an average of percentages**. In-flight numbers are estimates until a fresh full run.
 
 ## Step 5 - Adversarial review
 

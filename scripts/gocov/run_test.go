@@ -17,6 +17,14 @@ import (
 	"testing"
 )
 
+// The fake also: writes FAKE_CLAUDE_TESTS/<pkg>.go.txt (pkg = the prompt's
+// package dir, "/" as "_") as <pkg>/cov_test.go; while working on package
+// FAKE_CLAUDE_MUTATE_PKG, overwrites FAKE_CLAUDE_MUTATE_FILE with
+// FAKE_CLAUDE_MUTANT and holds it until a line of FAKE_CLAUDE_WAIT_FILE holds
+// every comma-separated FAKE_CLAUDE_WAIT_FOR; answers its first call with a
+// rate-limit error if the FAKE_CLAUDE_RATELIMIT marker file does not exist yet;
+// answers FAKE_CLAUDE_ERROR as a zero-cost error. Its cost never exceeds the
+// call's --max-budget-usd.
 const fakeClaudeSrc = `package main
 
 import (
@@ -24,6 +32,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -39,9 +49,29 @@ func main() {
 		fmt.Print(` + "`" + `{"is_error":false,"result":"ok","total_cost_usd":0}` + "`" + `)
 		return
 	}
-	io.Copy(io.Discard, os.Stdin)
+	in, _ := io.ReadAll(os.Stdin)
+	if m := os.Getenv("FAKE_CLAUDE_RATELIMIT"); m != "" {
+		if _, err := os.Stat(m); err != nil {
+			os.WriteFile(m, nil, 0o644)
+			fmt.Print(` + "`" + `{"is_error":true,"result":"API Error: 429 rate_limit_error: too many requests","total_cost_usd":0}` + "`" + `)
+			return
+		}
+	}
+	if e := os.Getenv("FAKE_CLAUDE_ERROR"); e != "" {
+		fmt.Printf(` + "`" + `{"is_error":true,"result":%q,"total_cost_usd":0}` + "`" + `, e)
+		return
+	}
+	pkg := ""
+	if m := regexp.MustCompile(` + "`" + `Package dir: (\S+)` + "`" + `).FindSubmatch(in); m != nil {
+		pkg = strings.TrimPrefix(string(m[1]), "./")
+	}
 	if d, err := time.ParseDuration(os.Getenv("FAKE_CLAUDE_SLEEP")); err == nil {
 		time.Sleep(d)
+	}
+	if pkg != "" && pkg == os.Getenv("FAKE_CLAUDE_MUTATE_PKG") {
+		data, _ := os.ReadFile(os.Getenv("FAKE_CLAUDE_MUTANT"))
+		os.WriteFile(filepath.Join(wd, filepath.FromSlash(os.Getenv("FAKE_CLAUDE_MUTATE_FILE"))), data, 0o644)
+		waitFor(os.Getenv("FAKE_CLAUDE_WAIT_FILE"), os.Getenv("FAKE_CLAUDE_WAIT_FOR"))
 	}
 	if src := os.Getenv("FAKE_CLAUDE_COPY"); src != "" {
 		data, _ := os.ReadFile(src)
@@ -49,11 +79,41 @@ func main() {
 		os.MkdirAll(filepath.Dir(dst), 0o755)
 		os.WriteFile(dst, data, 0o644)
 	}
-	cost := os.Getenv("FAKE_CLAUDE_COST")
-	if cost == "" {
-		cost = "0.1"
+	if dir := os.Getenv("FAKE_CLAUDE_TESTS"); dir != "" && pkg != "" {
+		if data, err := os.ReadFile(filepath.Join(dir, strings.ReplaceAll(pkg, "/", "_")+".go.txt")); err == nil {
+			os.WriteFile(filepath.Join(wd, filepath.FromSlash(pkg), "cov_test.go"), data, 0o644)
+		}
 	}
-	fmt.Printf(` + "`" + `{"is_error":false,"subtype":"success","result":"done","total_cost_usd":%s}` + "`" + `, cost)
+	cost, err := strconv.ParseFloat(os.Getenv("FAKE_CLAUDE_COST"), 64)
+	if err != nil {
+		cost = 0.1
+	}
+	for i, a := range os.Args {
+		if a == "--max-budget-usd" && i+1 < len(os.Args) {
+			if c, err := strconv.ParseFloat(os.Args[i+1], 64); err == nil && cost > c {
+				cost = c
+			}
+		}
+	}
+	fmt.Printf(` + "`" + `{"is_error":false,"subtype":"success","result":"done","total_cost_usd":%g}` + "`" + `, cost)
+}
+
+func waitFor(file, subs string) {
+	if file == "" {
+		return
+	}
+	for deadline := time.Now().Add(60 * time.Second); time.Now().Before(deadline); time.Sleep(100 * time.Millisecond) {
+		data, _ := os.ReadFile(file)
+		for _, line := range strings.Split(string(data), "\n") {
+			all := true
+			for _, s := range strings.Split(subs, ",") {
+				all = all && strings.Contains(line, s)
+			}
+			if all {
+				return
+			}
+		}
+	}
 }
 `
 
@@ -88,7 +148,9 @@ func fakeClaude(t *testing.T) string {
 	log := filepath.Join(t.TempDir(), "claude-calls.log")
 	t.Setenv("PATH", filepath.Join(fakeDir, "bin")+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv("FAKE_CLAUDE_LOG", log)
-	for _, k := range []string{"FAKE_CLAUDE_SLEEP", "FAKE_CLAUDE_COPY", "FAKE_CLAUDE_DEST", "FAKE_CLAUDE_COST"} {
+	for _, k := range []string{"FAKE_CLAUDE_SLEEP", "FAKE_CLAUDE_COPY", "FAKE_CLAUDE_DEST", "FAKE_CLAUDE_COST", "FAKE_CLAUDE_TESTS",
+		"FAKE_CLAUDE_MUTATE_PKG", "FAKE_CLAUDE_MUTATE_FILE", "FAKE_CLAUDE_MUTANT", "FAKE_CLAUDE_WAIT_FILE", "FAKE_CLAUDE_WAIT_FOR",
+		"FAKE_CLAUDE_RATELIMIT", "FAKE_CLAUDE_ERROR", "GOCOV_RUN_ID"} {
 		t.Setenv(k, "")
 	}
 	return log
