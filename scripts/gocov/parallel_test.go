@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -632,5 +633,63 @@ func TestSkillVersionMatchesSkillMD(t *testing.T) {
 	mustRun(t, "read SKILL.md", err)
 	if !regexp.MustCompile(`(?m)^\s*version: ` + regexp.QuoteMeta(skillVersion) + `\s*$`).Match(data) {
 		t.Errorf("SKILL.md's metadata.version differs from skillVersion %s", skillVersion)
+	}
+}
+
+func TestParallelMergeConflictRequeuesOnceThenBlocks(t *testing.T) {
+	o, dir, log := newParFixture(t, 100, 3)
+	// every item also writes testdata/shared.txt with its own content, so the
+	// cherry-picks of one wave conflict with each other
+	t.Setenv("FAKE_CLAUDE_SHARED", "testdata/shared.txt")
+	mustRun(t, "run", cmdRun(context.Background(), o))
+	st := state(t, o)
+
+	if _, err := os.Stat(filepath.Join(dir, ".git", "CHERRY_PICK_HEAD")); err == nil {
+		t.Fatal("a cherry-pick was left in progress on the work branch")
+	}
+	if out := gitOut(t, dir, "status", "--porcelain"); out != "" {
+		t.Errorf("work tree not clean after the run:\n%s", out)
+	}
+	if out := gitOut(t, dir, "branch", "--list", "cov/*"); out != "" {
+		t.Errorf("item branches left behind: %s", out)
+	}
+	if out := gitOut(t, dir, "worktree", "list"); strings.Count(out, "\n") > 0 {
+		t.Errorf("item worktrees left behind:\n%s", out)
+	}
+
+	starts, conflicts := map[string]int{}, 0
+	for _, e := range readEvents(t, o) {
+		switch e.Ev {
+		case "item-start":
+			starts[e.Item]++
+		case "merge-conflict":
+			conflicts++
+		}
+	}
+	if conflicts == 0 {
+		t.Fatal("no merge-conflict event: the fixture did not make cherry-picks collide")
+	}
+	var retriedDone, blocked int
+	var spent float64
+	for _, it := range st.Items {
+		spent += it.CostUSD
+		if starts[it.ID] > 2 {
+			t.Errorf("%s started %d times; a conflict may re-queue an item only once", it.ID, starts[it.ID])
+		}
+		switch {
+		case it.Status == "done" && starts[it.ID] == 2:
+			retriedDone++
+		case it.Status == "blocked":
+			blocked++
+			if starts[it.ID] != 2 || !strings.Contains(it.Reason, "did not merge onto the work branch twice") || !strings.Contains(it.Reason, "CONFLICT") {
+				t.Errorf("%s blocked after %d start(s), reason %q; want 2 starts and the git CONFLICT line", it.ID, starts[it.ID], it.Reason)
+			}
+		}
+	}
+	if retriedDone == 0 || blocked == 0 {
+		t.Errorf("%d re-queued item(s) merged and %d blocked; want at least one of each", retriedDone, blocked)
+	}
+	if calls := float64(len(modelCalls(t, log))) * 0.1; math.Abs(st.SpendUSD-calls) > 1e-9 || math.Abs(spent-calls) > 1e-9 {
+		t.Errorf("spend: state %.2f, items %.2f, calls %.2f; want all equal", st.SpendUSD, spent, calls)
 	}
 }

@@ -79,6 +79,10 @@ func main() {
 		os.MkdirAll(filepath.Dir(dst), 0o755)
 		os.WriteFile(dst, data, 0o644)
 	}
+	if f := os.Getenv("FAKE_CLAUDE_SHARED"); f != "" && pkg != "" { // the same testdata file, different content per package
+		os.MkdirAll(filepath.Dir(filepath.FromSlash(f)), 0o755)
+		os.WriteFile(filepath.FromSlash(f), []byte("written for "+pkg), 0o644)
+	}
 	if dir := os.Getenv("FAKE_CLAUDE_TESTS"); dir != "" && pkg != "" {
 		if data, err := os.ReadFile(filepath.Join(dir, strings.ReplaceAll(pkg, "/", "_")+".go.txt")); err == nil {
 			os.WriteFile(filepath.Join(wd, filepath.FromSlash(pkg), "cov_test.go"), data, 0o644)
@@ -150,7 +154,7 @@ func fakeClaude(t *testing.T) string {
 	t.Setenv("FAKE_CLAUDE_LOG", log)
 	for _, k := range []string{"FAKE_CLAUDE_SLEEP", "FAKE_CLAUDE_COPY", "FAKE_CLAUDE_DEST", "FAKE_CLAUDE_COST", "FAKE_CLAUDE_TESTS",
 		"FAKE_CLAUDE_MUTATE_PKG", "FAKE_CLAUDE_MUTATE_FILE", "FAKE_CLAUDE_MUTANT", "FAKE_CLAUDE_WAIT_FILE", "FAKE_CLAUDE_WAIT_FOR",
-		"FAKE_CLAUDE_RATELIMIT", "FAKE_CLAUDE_ERROR", "GOCOV_RUN_ID"} {
+		"FAKE_CLAUDE_RATELIMIT", "FAKE_CLAUDE_ERROR", "FAKE_CLAUDE_SHARED", "GOCOV_RUN_ID"} {
 		t.Setenv(k, "")
 	}
 	return log

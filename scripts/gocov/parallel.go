@@ -224,9 +224,20 @@ func cherryPick(root, sha string) (string, error) {
 	defer l.Unlock()
 	if out, err := git(root, "cherry-pick", sha); err != nil {
 		_, _ = git(root, "cherry-pick", "--abort")
-		return "", fmt.Errorf("%v: %s", err, firstLine(strings.TrimSpace(out)))
+		return "", fmt.Errorf("%v: %s", err, conflictLine(out))
 	}
 	return headSHA(root), nil
+}
+
+// conflictLine picks the line of git's output that says why a cherry-pick
+// failed ("CONFLICT (add/add): ..."), not the "Auto-merging" line before it.
+func conflictLine(out string) string {
+	for _, l := range strings.Split(out, "\n") {
+		if l = strings.TrimSpace(l); strings.HasPrefix(l, "CONFLICT") || strings.HasPrefix(l, "error:") {
+			return l
+		}
+	}
+	return firstLine(strings.TrimSpace(out))
 }
 
 // ----------------------------------------------------------------- workers ----
